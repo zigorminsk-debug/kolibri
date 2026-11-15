@@ -147,11 +147,14 @@ jobs:
 
           # The project's own name wins; the identifier is always ours, so
           # that it is valid for Android whatever the project declares.
-          args=(--os android --app-id "$APP_ID" --icon "$icon" --app-version "1.0.$BUILD" --app-build "$BUILD")
+          # 64- and 32-bit ARM cover phones and tablets; the x86 builds are
+          # only for emulators and would double the size of the APK.
+          args=(--os "android/arm64,android/arm,android/amd64" --app-id "$APP_ID" --icon "$icon" --app-version "1.0.$BUILD" --app-build "$BUILD")
           if [ ! -f FyneApp.toml ] || ! grep -Eq '^[[:space:]]*Name[[:space:]]*=' FyneApp.toml; then
             args+=(--name "$APP_NAME")
           fi
-          "$(go env GOPATH)/bin/fyne" package "${args[@]}"
+          # Without debug information the package is about a third smaller.
+          GOFLAGS="-ldflags=-w -trimpath" "$(go env GOPATH)/bin/fyne" package "${args[@]}"
           mkdir -p dist
           mv ./*.apk dist/
       - name: Report
@@ -162,7 +165,7 @@ jobs:
             echo "ANDROID_HOME=${ANDROID_HOME:-} ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
             echo "NDK_LATEST=${ANDROID_NDK_LATEST_HOME:-} NDK_HOME=${ANDROID_NDK_HOME:-} NDK=${ANDROID_NDK:-}"
             go version
-            tail -n 25 "$RUNNER_TEMP/android.log" 2>&1 || true
+            tail -n 6 "$RUNNER_TEMP/android.log" 2>&1 || true
             ls -la dist 2>&1 || true
             ls -la . 2>&1 | head -20
             bt="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
@@ -173,7 +176,58 @@ jobs:
               "$bt/apksigner" verify --print-certs "$f" 2>&1 | head -6
             done
           } > report.txt 2>&1
-          echo "::notice title=AndroidProbe::$(sed 's/%/%25/g' report.txt | cut -c1-400 | head -90 | awk '{printf "%s%%0A", $0}')"
+          echo "::notice title=AndroidProbe::$(sed 's/%/%25/g' report.txt | cut -c1-300 | head -70 | awk '{printf "%s%%0A", $0}')"
+      - name: Enable KVM
+        if: matrix.target == 'android'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Write the emulator script
+        if: matrix.target == 'android'
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/emu.sh" <<'EMU'
+          pkg=io.github.zigorminsk_debug.probe_app
+          {
+            adb install -r dist/*.apk
+            adb shell monkey -p "$pkg" -c android.intent.category.LAUNCHER 1
+            sleep 25
+            echo "pid: $(adb shell pidof "$pkg")"
+            adb shell dumpsys window | grep -E "mCurrentFocus" | head -3
+            adb shell input tap 540 300
+            sleep 2
+            adb exec-out screencap -p > "$RUNNER_TEMP/screen.png"
+            ls -l "$RUNNER_TEMP/screen.png"
+            echo "pid after tap: $(adb shell pidof "$pkg")"
+            adb logcat -d | grep -E "GoLog|Fyne|FATAL|AndroidRuntime|$pkg" | tail -25
+          } > "$RUNNER_TEMP/emu.txt" 2>&1
+          exit 0
+          EMU
+      - name: Run on an emulator
+        if: matrix.target == 'android'
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: default
+          disable-animations: true
+          script: bash "$RUNNER_TEMP/emu.sh"
+      - name: Report the emulator
+        if: always() && matrix.target == 'android'
+        shell: bash
+        run: |
+          echo "::notice title=Emulator::$(sed 's/%/%25/g' "$RUNNER_TEMP/emu.txt" | cut -c1-300 | head -60 | awk '{printf "%s%%0A", $0}')"
+          python3 -m pip install --quiet pillow || true
+          python3 - <<'PY' || true
+          import base64, io, os
+          from PIL import Image
+          img = Image.open(os.path.join(os.environ["RUNNER_TEMP"], "screen.png")).convert("RGB")
+          img = img.resize((img.width // 3, img.height // 3)).quantize(24)
+          buf = io.BytesIO()
+          img.save(buf, "PNG", optimize=True)
+          print("::notice title=Screen::" + base64.b64encode(buf.getvalue()).decode())
+          PY
       - name: Upload build
         uses: actions/upload-artifact@v7
         with:
