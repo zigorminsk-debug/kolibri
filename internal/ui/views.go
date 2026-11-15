@@ -47,6 +47,14 @@ type journal struct {
 	empty  *fyne.Container
 	root   *fyne.Container
 	plain  []string
+
+	// sink receives every line as well: the log file on disk.
+	sink func(level pipeline.Level, msg string, at time.Time)
+	// logDir is the folder of that file, "" when there is none.
+	logDir  string
+	openDir func(string)
+	fileBtn *widget.Button
+	foot    *fyne.Container
 }
 
 func newJournal(onCopy func(string)) *journal {
@@ -56,7 +64,15 @@ func newJournal(onCopy func(string)) *journal {
 	j.empty = emptyState("Здесь появится ход работы",
 		"Опишите задачу слева и нажмите «Запустить». Колибри напишет код, приложение отправит его в GitHub, а Actions соберёт программу.")
 	copyBtn := quietButton("Копировать журнал", theme.ContentCopyIcon(), func() { onCopy(j.text()) })
-	j.filled = container.NewBorder(nil, container.NewHBox(layout.NewSpacer(), copyBtn), nil, nil, j.scroll)
+	// The journal on screen is cleared by the next run; the file is not.
+	j.fileBtn = quietButton("Журнал на диске", theme.FolderOpenIcon(), func() {
+		if j.openDir != nil && j.logDir != "" {
+			j.openDir(j.logDir)
+		}
+	})
+	j.fileBtn.Hide()
+	j.foot = container.NewHBox(layout.NewSpacer(), j.fileBtn, copyBtn)
+	j.filled = container.NewBorder(nil, j.foot, nil, nil, j.scroll)
 	j.filled.Hide()
 	j.root = container.NewStack(j.empty, j.filled)
 	return j
@@ -66,6 +82,17 @@ var levelMarks = map[pipeline.Level]string{pipeline.Info: "·", pipeline.Good: "
 
 func (j *journal) add(level pipeline.Level, msg string, at time.Time) {
 	j.plain = append(j.plain, at.Format("15:04:05")+"  "+levelMarks[level]+" "+msg)
+	if j.sink != nil {
+		j.sink(level, msg, at)
+	}
+	if show := j.logDir != "" && j.openDir != nil; show != j.fileBtn.Visible() {
+		if show {
+			j.fileBtn.Show()
+		} else {
+			j.fileBtn.Hide()
+		}
+		j.foot.Refresh()
+	}
 
 	colorName := theme.ColorNameForeground
 	switch level {

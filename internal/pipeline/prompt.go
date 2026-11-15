@@ -27,9 +27,17 @@ Rules:
 - Do not wrap file content in Markdown code fences.
 - To remove a file write a single line: === DELETE: relative/path ===
 - Files you do not mention stay as they are.
-- Never create files under .github/ — the build workflow is supplied by the pipeline.
+- Never create files under .github/ or .kolibri/ — the build workflow and the work log are kept by the pipeline.
 - Text files only. No explanations before, between or after the blocks.
-- Write user-facing text, comments and the README in the language of the task.`
+- Write user-facing text, comments and the README in the language of the task.
+
+Large tasks: you have no memory between requests. When a work log is shown, it is the history of this project — continue from it and do not redo finished work. If the whole task does not fit into one reply, do a coherent part that builds on its own and, after the last file, list what is left:
+
+=== NEXT ===
+- <a remaining step>
+=== END NEXT ===
+
+Leave the NEXT block out when the task is finished.`
 
 var targetTitles = map[string]string{"windows": "Windows", "linux": "Linux", "macos": "macOS"}
 
@@ -132,13 +140,33 @@ func projectSection(b *strings.Builder, project map[string]string, otherPaths []
 	}
 }
 
+// promptExtra is what a request carries besides the task and the files.
+type promptExtra struct {
+	// history is the end of the project's work log.
+	history string
+	// resume tells the model that it continues a reply that was cut short.
+	resume string
+}
+
+func (e promptExtra) write(b *strings.Builder) {
+	if e.resume != "" {
+		b.WriteString("\n\nContinuation: ")
+		b.WriteString(e.resume)
+	}
+	if e.history != "" {
+		b.WriteString("\n\nWork log of this project, oldest entry first. The pipeline keeps it; the newest entry is the last step taken:\n\n")
+		b.WriteString(e.history)
+	}
+}
+
 // taskMessages builds the first request of a run.
-func taskMessages(task Task, kind workflow.Kind, project map[string]string, otherPaths []string, budget int) []colibri.Message {
+func taskMessages(task Task, kind workflow.Kind, project map[string]string, otherPaths []string, budget int, extra promptExtra) []colibri.Message {
 	var b strings.Builder
 	b.WriteString("Task:\n")
 	b.WriteString(strings.TrimSpace(task.Prompt))
 	b.WriteString("\n\n")
 	b.WriteString(buildRules(kind, task.Targets))
+	extra.write(&b)
 	fmt.Fprintf(&b, "\n\nRepository: %s/%s\n", task.Owner, task.Repo)
 	projectSection(&b, project, otherPaths, budget, nil)
 	return []colibri.Message{
@@ -148,7 +176,7 @@ func taskMessages(task Task, kind workflow.Kind, project map[string]string, othe
 }
 
 // fixMessages builds the request sent after a failed build.
-func fixMessages(task Task, kind workflow.Kind, project map[string]string, otherPaths []string, budget int, failure string) []colibri.Message {
+func fixMessages(task Task, kind workflow.Kind, project map[string]string, otherPaths []string, budget int, failure string, extra promptExtra) []colibri.Message {
 	// Files the log mentions are the ones the model must see.
 	first := map[string]bool{}
 	for p := range project {
@@ -169,6 +197,7 @@ func fixMessages(task Task, kind workflow.Kind, project map[string]string, other
 	b.WriteString(buildRules(kind, task.Targets))
 	b.WriteString("\n\nBuild log:\n")
 	b.WriteString(failure)
+	extra.write(&b)
 	b.WriteString("\n\n")
 	projectSection(&b, project, otherPaths, budget, first)
 	return []colibri.Message{

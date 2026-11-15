@@ -21,16 +21,20 @@ import (
 )
 
 const (
-	autoModel   = "Первая на сервере"
-	newTokenURL = "https://github.com/settings/tokens/new?scopes=repo,workflow&description=Kolibri%20Forge"
+	autoModel = "Первая на сервере"
 )
 
 func sectionTitle(s string) fyne.CanvasObject {
 	return container.New(layout.NewCustomPaddedLayout(10, 2, 0, 0), text(s, 15, colText, fyne.TextStyle{Bold: true}))
 }
 
-// status is a one-line result of a "check" button.
-type status struct{ label *widget.Label }
+// status is a one-line result of a "check" button. It appears and changes
+// height as it is set, so the layout around it has to be redone: after does
+// that.
+type status struct {
+	label *widget.Label
+	after func()
+}
 
 func newStatus() *status {
 	l := widget.NewLabel("")
@@ -43,6 +47,16 @@ func (s *status) set(msg string, importance widget.Importance) {
 	s.label.Importance = importance
 	s.label.SetText(msg)
 	s.label.Show()
+	if s.after != nil {
+		s.after()
+	}
+}
+
+func (s *status) clear() {
+	s.label.Hide()
+	if s.after != nil {
+		s.after()
+	}
 }
 
 func (u *UI) showSettings() {
@@ -79,11 +93,11 @@ func (u *UI) showSettings() {
 		checkLLM.Disable()
 		llmStatus.set("Спрашиваю сервер…", widget.LowImportance)
 		client := &colibri.Client{BaseURL: address.Text, APIKey: strings.TrimSpace(llmKey.Text)}
-		go func() {
+		u.spawn(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			models, err := client.Models(ctx)
-			fyne.Do(func() {
+			u.do(func() {
 				checkLLM.Enable()
 				if err != nil {
 					llmStatus.set(capitalize(err.Error()), widget.DangerImportance)
@@ -105,7 +119,7 @@ func (u *UI) showSettings() {
 				}
 				llmStatus.set("Колибри на связи: "+strings.Join(names, ", "), widget.SuccessImportance)
 			})
-		}()
+		})
 	})
 
 	temperature := widget.NewEntry()
@@ -135,12 +149,12 @@ func (u *UI) showSettings() {
 		}
 		checkGH.Disable()
 		ghStatus.set("Спрашиваю GitHub…", widget.LowImportance)
-		client := &ghapi.Client{Token: value}
-		go func() {
+		client := u.github(value)
+		u.spawn(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			user, err := client.CurrentUser(ctx)
-			fyne.Do(func() {
+			u.do(func() {
 				checkGH.Enable()
 				switch {
 				case err != nil:
@@ -155,9 +169,12 @@ func (u *UI) showSettings() {
 					ghStatus.set("Токен принят, аккаунт "+user.Login+". Права repo и workflow есть.", widget.SuccessImportance)
 				}
 			})
-		}()
+		})
 	})
-	tokenLink := widget.NewHyperlink("Создать токен с нужными правами", mustURL(newTokenURL))
+	tokenLink := widget.NewHyperlink("Создать токен с нужными правами", mustURL(ghapi.TokenURL()))
+	clientID := widget.NewEntry()
+	clientID.SetText(cfg.GitHubClientID)
+	clientID.SetPlaceHolder("Ov23li… — не обязательно")
 
 	outDir := widget.NewEntry()
 	outDir.SetText(cfg.OutputDir)
@@ -191,6 +208,8 @@ func (u *UI) showSettings() {
 		hint("Classic-токену нужны области repo и workflow. Fine-grained — Contents и Workflows: Read and write, Actions: Read. Токен хранится в файле настроек на этом компьютере."),
 		container.NewHBox(checkGH, tokenLink),
 		ghStatus.label,
+		row("Client ID OAuth-приложения", clientID),
+		hint("Нужен только для входа через браузер, без токена. Создайте OAuth App в GitHub → Settings → Developer settings, включите в нём «Enable Device Flow» и вставьте сюда его Client ID."),
 
 		sectionTitle("Генерация"),
 		three,
@@ -201,6 +220,10 @@ func (u *UI) showSettings() {
 		problem.label,
 		gap(0, 4),
 	)
+
+	for _, st := range []*status{llmStatus, ghStatus, problem} {
+		st.after = form.Refresh
+	}
 
 	var dlg *dialog.CustomDialog
 	save := widget.NewButtonWithIcon("Сохранить", theme.DocumentSaveIcon(), func() {
@@ -234,6 +257,7 @@ func (u *UI) showSettings() {
 		}
 		next.IdleTimeoutMin = m
 		next.GitHubToken = strings.TrimSpace(token.Text)
+		next.GitHubClientID = strings.TrimSpace(clientID.Text)
 		if dir := strings.TrimSpace(outDir.Text); dir != "" {
 			next.OutputDir = dir
 		}

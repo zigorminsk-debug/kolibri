@@ -24,6 +24,9 @@ type fakeReply struct {
 	finish    string // defaults to "stop"
 	status    int    // non-zero: answer with this HTTP error
 	errCode   string
+	// drop: the server dies after sending the content — the connection
+	// breaks without a finish reason.
+	drop bool
 }
 
 type fakeLLM struct {
@@ -95,6 +98,9 @@ func (f *fakeLLM) handle(w http.ResponseWriter, r *http.Request) {
 		for i := 0; i < len(text); i += 7 {
 			end := min(i+7, len(text))
 			send(map[string]string{"content": string(text[i:end])}, nil)
+		}
+		if rep.drop {
+			panic(http.ErrAbortHandler)
 		}
 		finish := rep.finish
 		if finish == "" {
@@ -407,7 +413,8 @@ func (g *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		g.refs[branch] = sha
-		if !g.noRuns {
+		// Like GitHub, the fake starts no workflow for a [skip ci] commit.
+		if !g.noRuns && !strings.Contains(g.commits[sha].message, "[skip ci]") {
 			ok, log := g.judge(g.files(sha))
 			g.runs = append(g.runs, &fakeRun{id: int64(1000 + len(g.runs)), number: len(g.runs) + 1, sha: sha, ok: ok, log: log})
 		}

@@ -14,6 +14,7 @@ import (
 	"github.com/zigorminsk-debug/kolibri/internal/colibri"
 	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
 	"github.com/zigorminsk-debug/kolibri/internal/workflow"
+	"github.com/zigorminsk-debug/kolibri/internal/worklog"
 )
 
 const failingLog = "2026-11-15T07:00:00.0000000Z ##[group]Run actions/checkout@v7\n" +
@@ -77,7 +78,7 @@ func TestRunCreatesRepoFixesBuildAndDelivers(t *testing.T) {
 
 	// GitHub side.
 	files := gh.headFiles("main")
-	if got, want := sortedKeys(files), []string{".github/workflows/kolibri-build.yml", "README.md", "go.mod", "main.go"}; !reflect.DeepEqual(got, want) {
+	if got, want := sortedKeys(files), []string{".github/workflows/kolibri-build.yml", ".kolibri/worklog.md", "README.md", "go.mod", "main.go"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("files in branch = %v, want %v", got, want)
 	}
 	if files["main.go"] != "package main\n\nfunc main() {}\n" {
@@ -92,9 +93,45 @@ func TestRunCreatesRepoFixesBuildAndDelivers(t *testing.T) {
 	if strings.Contains(wf, "macos") {
 		t.Error("workflow builds for macOS although it was not requested")
 	}
+	// Two code commits, then the closing line of the work log, which must
+	// not start a third build.
 	hist := gh.history("main")
-	if len(hist) != 3 || !strings.HasPrefix(hist[0], "fix: Remove undefined call") || !strings.HasPrefix(hist[1], "Add demo program") {
+	if len(hist) != 4 || !strings.HasPrefix(hist[0], "docs: итог в журнале работы") || !strings.Contains(hist[0], "[skip ci]") ||
+		!strings.HasPrefix(hist[1], "fix: Remove undefined call") || !strings.HasPrefix(hist[2], "Add demo program") {
 		t.Errorf("history = %q", hist)
+	}
+	if len(gh.runs) != 2 {
+		t.Errorf("builds started = %d, want 2", len(gh.runs))
+	}
+
+	// The work log tells the whole story, in order.
+	doc := files[worklog.Path]
+	order := []string{
+		"# Журнал работы", "— Задача\n", "- **Задача:** Сделай программу demo", "- **Модель:** qwen-test", "- **Сделано:** Add demo program",
+		"`+ go.mod`, `+ main.go`", "— Исправление сборки (попытка 2)\n", "- **Ошибка сборки:** ./main.go:5:2: undefined: BUG",
+		"- **Сделано:** Remove undefined call", "- **Файлы:** `~ main.go`",
+		"- **Итог:** сборка прошла — https://github.test/me/demo/actions/runs/1001; релиз https://github.test/me/demo/releases/tag/build-2",
+	}
+	pos := 0
+	for _, want := range order {
+		i := strings.Index(doc[pos:], want)
+		if i < 0 {
+			t.Fatalf("work log lacks %q after offset %d:\n%s", want, pos, doc)
+		}
+		pos += i
+	}
+	if strings.Contains(doc, "evil.yml") || strings.Contains(doc, "test-token") || strings.Count(doc, "**Задача:**") != 1 {
+		t.Errorf("work log has what it must not:\n%s", doc)
+	}
+	if out.LogURL != "https://github.test/me/demo/blob/main/.kolibri/worklog.md" {
+		t.Errorf("log url = %q", out.LogURL)
+	}
+	// The fix request shows the model its own previous step.
+	if fix := llm.request(1); !strings.Contains(fix, "Work log of this project") || !strings.Contains(fix, "- **Сделано:** Add demo program") {
+		t.Errorf("fix request lacks the work log:\n%s", fix)
+	}
+	if first := llm.request(0); strings.Contains(first, "Work log of this project") {
+		t.Error("a new project has no work log to show")
 	}
 
 	// The fix request must carry the compiler error, not the log noise.
@@ -206,7 +243,7 @@ func TestRunOnExistingProject(t *testing.T) {
 		t.Errorf("request has lock file content or the auto contract:\n%s", req)
 	}
 	files := gh.headFiles("feature/v2")
-	if got, want := sortedKeys(files), []string{".github/workflows/kolibri-build.yml", "go.mod", "go.sum", "logo.png", "main.go"}; !reflect.DeepEqual(got, want) {
+	if got, want := sortedKeys(files), []string{".github/workflows/kolibri-build.yml", ".kolibri/worklog.md", "go.mod", "go.sum", "logo.png", "main.go"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("files = %v, want %v", got, want)
 	}
 	if !strings.Contains(files[workflow.Path], `branches: ["feature/v2"]`) || strings.Contains(files[workflow.Path], "release") {
@@ -215,8 +252,11 @@ func TestRunOnExistingProject(t *testing.T) {
 	if _, moved := gh.headFiles("main")[workflow.Path]; moved {
 		t.Error("main was touched although the task works in a branch")
 	}
-	if hist := gh.history("feature/v2"); !strings.HasPrefix(hist[0], "Выведи v2\n\n") {
-		t.Errorf("commit message = %q", hist[0])
+	if hist := gh.history("feature/v2"); !strings.HasPrefix(hist[1], "Выведи v2\n\n") {
+		t.Errorf("commit message = %q", hist[1])
+	}
+	if doc := files[worklog.Path]; !strings.Contains(doc, "- **Файлы:** `~ main.go`, `- old/notes.md`\n") {
+		t.Errorf("work log:\n%s", doc)
 	}
 	// go.mod was repeated unchanged: it must not be listed as a change.
 	var changed []string
@@ -288,6 +328,10 @@ func TestRunStopsAfterAllowedFixes(t *testing.T) {
 	}
 	if llm.count() != 2 {
 		t.Errorf("model requests = %d, want 2", llm.count())
+	}
+	doc := gh.headFiles("main")[worklog.Path]
+	if !strings.HasSuffix(doc, "- **Итог:** сборка не прошла после 2 попыток. Последняя ошибка: ./main.go:5:2: undefined: BUG\n") {
+		t.Errorf("work log:\n%s", doc)
 	}
 }
 
@@ -417,7 +461,7 @@ func TestRunOnEmptyRepository(t *testing.T) {
 	if out.Kind != workflow.Static {
 		t.Errorf("kind = %s", out.Kind)
 	}
-	if got := sortedKeys(gh.headFiles("main")); len(got) != 3 {
+	if got := sortedKeys(gh.headFiles("main")); len(got) != 4 {
 		t.Errorf("files = %v", got)
 	}
 }
@@ -468,5 +512,205 @@ func TestFileBudget(t *testing.T) {
 	}
 	if b := fileBudget(16384, 16000, 60000); b != 0 {
 		t.Errorf("overfull prompt: budget = %d", b)
+	}
+}
+
+// A project larger than one reply: the reply is cut in the middle of a
+// file, and the in-place continuation does not fit either. What is whole is
+// committed without a build, and the model continues in a fresh request.
+func TestRunSavesCutReplyAndContinues(t *testing.T) {
+	gh := newFakeGitHub(t)
+	llm := newFakeLLM(t, func(n int, messages []colibri.Message) fakeReply {
+		switch n {
+		case 0:
+			return fakeReply{finish: "length", content: "SUMMARY: Каркас\n\n=== FILE: go.mod ===\nmodule demo\n\ngo 1.22\n=== END FILE ===\n\n" +
+				"=== FILE: main.go ===\npackage main\n\nfunc main() { run() }\n=== END FILE ===\n\n=== FILE: run.go ===\npackage main\n\nfunc run() {"}
+		case 1:
+			// The continuation in the same context has no room left.
+			return fakeReply{status: 400, errCode: "context_length_exceeded"}
+		default:
+			return fakeReply{content: "SUMMARY: Дописан run.go\n\n=== FILE: run.go ===\npackage main\n\nfunc run() {}\n=== END FILE ===\n\n" +
+				"=== NEXT ===\n- добавить тесты\n=== END NEXT ===\n"}
+		}
+	})
+	runner, rec := newRunner(t, llm, gh)
+	out, err := runner.Run(context.Background(), baseTask(t))
+	if err != nil {
+		t.Fatalf("Run: %v\n%s", err, rec.journal())
+	}
+
+	hist := gh.history("main")
+	if len(hist) != 4 || !strings.HasPrefix(hist[2], "wip: Каркас") || !strings.Contains(hist[2], "[skip ci]") ||
+		!strings.HasPrefix(hist[1], "Дописан run.go") || strings.Contains(hist[1], "[skip ci]") {
+		t.Fatalf("history = %q", hist)
+	}
+	// Only the finished project is built.
+	if len(gh.runs) != 1 || out.Attempts != 1 {
+		t.Errorf("builds = %d, attempts = %d", len(gh.runs), out.Attempts)
+	}
+	files := gh.headFiles("main")
+	if files["run.go"] != "package main\n\nfunc run() {}\n" || files["main.go"] == "" {
+		t.Errorf("files = %v", sortedKeys(files))
+	}
+
+	// The fresh request knows what happened and sees what was saved.
+	req := llm.request(2)
+	for _, want := range []string{
+		"Continuation: Your previous reply was cut off in the middle of the file run.go",
+		"Work log of this project", "- **Не завершено:** ответ оборвался на файле run.go",
+		"func main() { run() }", "Сделай программу demo",
+	} {
+		if !strings.Contains(req, want) {
+			t.Errorf("continuation request lacks %q:\n%s", want, req)
+		}
+	}
+	if strings.Contains(req, "[assistant]") {
+		t.Error("the continuation must start with a clean context")
+	}
+
+	doc := files[worklog.Path]
+	for _, want := range []string{"— Задача\n", "— Продолжение оборванного ответа\n", "- **Осталось сделать:**\n  - добавить тесты\n", "- **Итог:** сборка прошла"} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("work log lacks %q:\n%s", want, doc)
+		}
+	}
+	if out.Next != "- добавить тесты" {
+		t.Errorf("Next = %q", out.Next)
+	}
+	if !strings.Contains(rec.journal(), "без запуска сборки") {
+		t.Errorf("journal:\n%s", rec.journal())
+	}
+}
+
+// The Colibri server is stopped in the middle of an answer: the files that
+// arrived whole are committed, and the next run picks the work up.
+func TestRunCommitsWhatArrivedWhenColibriDies(t *testing.T) {
+	gh := newFakeGitHub(t)
+	alive := false
+	llm := newFakeLLM(t, func(n int, _ []colibri.Message) fakeReply {
+		if !alive {
+			return fakeReply{drop: true, content: "SUMMARY: Каркас\n\n=== FILE: go.mod ===\nmodule demo\n\ngo 1.22\n=== END FILE ===\n\n" +
+				"=== FILE: main.go ===\npackage main\n\nfunc main() { run() }\n=== END FILE ===\n\n=== FILE: run.go ===\npackage main\n\nfunc ru"}
+		}
+		return fakeReply{content: "SUMMARY: Дописан run.go\n\n=== FILE: run.go ===\npackage main\n\nfunc run() {}\n=== END FILE ===\n"}
+	})
+	runner, rec := newRunner(t, llm, gh)
+	out, err := runner.Run(context.Background(), baseTask(t))
+	var cut *InterruptedError
+	if !errors.As(err, &cut) || !errors.Is(err, colibri.ErrCutShort) {
+		t.Fatalf("err = %v\n%s", err, rec.journal())
+	}
+	if !strings.Contains(err.Error(), "запустите задачу снова") || cut.Saved != 3 {
+		t.Errorf("message = %q, saved = %d", err.Error(), cut.Saved)
+	}
+	if out.CommitSHA == "" || out.LogURL == "" {
+		t.Errorf("outcome = %+v", out)
+	}
+	files := gh.headFiles("main")
+	if _, half := files["run.go"]; half || files["main.go"] == "" {
+		t.Fatalf("files = %v: whole files must be saved, the broken one must not", sortedKeys(files))
+	}
+	if len(gh.runs) != 0 {
+		t.Errorf("an unfinished project was sent to build %d times", len(gh.runs))
+	}
+	doc := files[worklog.Path]
+	for _, want := range []string{"- **Не завершено:** ответ оборвался на файле run.go", "- **Итог:** ответ модели прервался: Колибри оборвал ответ"} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("work log lacks %q:\n%s", want, doc)
+		}
+	}
+
+	// Second run, the model has no memory of the first one.
+	alive = true
+	before := llm.count()
+	out, err = runner.Run(context.Background(), baseTask(t))
+	if err != nil {
+		t.Fatalf("second run: %v\n%s", err, rec.journal())
+	}
+	req := llm.request(before)
+	for _, want := range []string{"Work log of this project", "ответ оборвался на файле run.go", "ответ модели прервался", "func main() { run() }"} {
+		if !strings.Contains(req, want) {
+			t.Errorf("second run's request lacks %q:\n%s", want, req)
+		}
+	}
+	if strings.Contains(req, "# Журнал работы") || strings.Contains(req, "=== FILE: "+worklog.Path) {
+		t.Errorf("the log must come as history, not as a project file:\n%s", req)
+	}
+	files = gh.headFiles("main")
+	if files["run.go"] != "package main\n\nfunc run() {}\n" || len(gh.runs) != 1 {
+		t.Errorf("run.go = %q, builds = %d", files["run.go"], len(gh.runs))
+	}
+	if n := worklog.Entries(files[worklog.Path]); n != 2 {
+		t.Errorf("work log entries = %d, want 2:\n%s", n, files[worklog.Path])
+	}
+	if !strings.Contains(rec.journal(), "В репозитории есть журнал работы (1 запись)") {
+		t.Errorf("journal:\n%s", rec.journal())
+	}
+}
+
+// The model keeps hitting the limit without producing anything new.
+func TestRunStopsWhenCutRepliesMakeNoProgress(t *testing.T) {
+	gh := newFakeGitHub(t)
+	llm := newFakeLLM(t, func(n int, messages []colibri.Message) fakeReply {
+		if messages[len(messages)-1].Role == "assistant" {
+			return fakeReply{status: 400, errCode: "context_length_exceeded"}
+		}
+		return fakeReply{finish: "length", content: "=== FILE: go.mod ===\nmodule demo\n=== END FILE ===\n=== FILE: main.go ===\npackage main\n\nfunc"}
+	})
+	runner, rec := newRunner(t, llm, gh)
+	_, err := runner.Run(context.Background(), baseTask(t))
+	if err == nil || !strings.Contains(err.Error(), "снова оборвался") {
+		t.Fatalf("err = %v\n%s", err, rec.journal())
+	}
+	if llm.count() != 4 {
+		t.Errorf("model requests = %d, want 4", llm.count())
+	}
+	doc := gh.headFiles("main")[worklog.Path]
+	if !strings.Contains(doc, "- **Итог:** работа прервана: ответ модели снова оборвался") || len(gh.runs) != 0 {
+		t.Errorf("builds = %d, work log:\n%s", len(gh.runs), doc)
+	}
+}
+
+// Stop during a build: the code is committed already, the log says why
+// the work ended.
+func TestRunStoppedDuringBuildClosesLog(t *testing.T) {
+	gh := newFakeGitHub(t)
+	gh.noRuns = true
+	llm := newFakeLLM(t, func(int, []colibri.Message) fakeReply {
+		return fakeReply{content: goodReply("package main\n\nfunc main() {}\n")}
+	})
+	runner, rec := newRunner(t, llm, gh)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for i := 0; i < 5000; i++ {
+			if strings.Contains(rec.journal(), "Коммит ") {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+	_, err := runner.Run(ctx, baseTask(t))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v\n%s", err, rec.journal())
+	}
+	doc := gh.headFiles("main")[worklog.Path]
+	if !strings.Contains(doc, "- **Итог:** работа остановлена пользователем") {
+		t.Errorf("work log:\n%s", doc)
+	}
+}
+
+func TestModelCannotWriteTheWorkLog(t *testing.T) {
+	gh := newFakeGitHub(t)
+	llm := newFakeLLM(t, func(int, []colibri.Message) fakeReply {
+		return fakeReply{content: goodReply("package main\n\nfunc main() {}\n") + "=== FILE: .kolibri/worklog.md ===\nвсё готово\n=== END FILE ===\n"}
+	})
+	runner, rec := newRunner(t, llm, gh)
+	if _, err := runner.Run(context.Background(), baseTask(t)); err != nil {
+		t.Fatalf("Run: %v\n%s", err, rec.journal())
+	}
+	if doc := gh.headFiles("main")[worklog.Path]; strings.Contains(doc, "всё готово") || !strings.HasPrefix(doc, "# Журнал работы") {
+		t.Errorf("work log:\n%s", doc)
 	}
 }

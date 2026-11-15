@@ -2,20 +2,25 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"image/png"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/widget"
 
 	"github.com/zigorminsk-debug/kolibri/internal/config"
 	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
 	"github.com/zigorminsk-debug/kolibri/internal/pipeline"
+	"github.com/zigorminsk-debug/kolibri/internal/runlog"
 )
 
 var shots = flag.String("shots", "", "write screenshots of the main states into this directory")
@@ -28,6 +33,12 @@ func newTestUI(t *testing.T, cfg config.Config, w, h float32) (*UI, fyne.Window)
 	t.Cleanup(win.Close)
 	u := New(app, win, cfg)
 	u.Save = func(c config.Config) error { return nil }
+	var uiMu sync.Mutex
+	u.runUI = func(fn func()) {
+		uiMu.Lock()
+		defer uiMu.Unlock()
+		fn()
+	}
 	win.Resize(fyne.NewSize(w, h))
 	return u, win
 }
@@ -305,4 +316,153 @@ func TestGroupDigitsAndClock(t *testing.T) {
 	if got := clock(time.Hour + 61*time.Second); got != "1:01:01" {
 		t.Errorf("clock = %q", got)
 	}
+}
+
+// ---- finding widgets inside open dialogs --------------------------------
+
+// walk visits every object of the window, overlays (dialogs) included.
+func walk(u *UI, visit func(fyne.CanvasObject)) {
+	var rec func(o fyne.CanvasObject)
+	rec = func(o fyne.CanvasObject) {
+		if o == nil {
+			return
+		}
+		visit(o)
+		switch c := o.(type) {
+		case *fyne.Container:
+			for _, child := range c.Objects {
+				rec(child)
+			}
+		case fyne.Widget:
+			for _, child := range test.WidgetRenderer(c).Objects() {
+				rec(child)
+			}
+		}
+	}
+	canvas := u.win.Canvas()
+	for _, o := range canvas.Overlays().List() {
+		rec(o)
+	}
+}
+
+func findButton(t *testing.T, u *UI, label string) *widget.Button {
+	t.Helper()
+	var found *widget.Button
+	walk(u, func(o fyne.CanvasObject) {
+		if b, ok := o.(*widget.Button); ok && b.Text == label && b.Visible() {
+			found = b
+		}
+	})
+	if found == nil {
+		t.Fatalf("no button %q in the open dialogs", label)
+	}
+	return found
+}
+
+func findEntry(t *testing.T, u *UI, placeholder string) *widget.Entry {
+	t.Helper()
+	var found *widget.Entry
+	walk(u, func(o fyne.CanvasObject) {
+		if e, ok := o.(*widget.Entry); ok && e.PlaceHolder == placeholder {
+			found = e
+		}
+	})
+	if found == nil {
+		t.Fatalf("no entry %q in the open dialogs", placeholder)
+	}
+	return found
+}
+
+func findList(t *testing.T, u *UI) *widget.List {
+	t.Helper()
+	var found *widget.List
+	walk(u, func(o fyne.CanvasObject) {
+		if l, ok := o.(*widget.List); ok {
+			found = l
+		}
+	})
+	if found == nil {
+		t.Fatal("no list in the open dialogs")
+	}
+	return found
+}
+
+// A reply that broke off and a stage with work left over are not failures:
+// the banner says what was saved and how to continue, and every line of
+// the journal lands in the log file.
+func TestUnfinishedWorkAndLogFile(t *testing.T) {
+	u, win := newTestUI(t, demoConfig(), 1240, 800)
+	logPath := filepath.Join(t.TempDir(), "kolibri-forge.log")
+	u.Log = runlog.New(logPath)
+	u.journal.logDir = filepath.Dir(logPath)
+	var opened string
+	u.journal.openDir = func(dir string) { opened = dir }
+
+	play(u, pipeline.StageGenerate)
+	observer{u}.Log(pipeline.Warn, "Ответ модели прервался: Колибри оборвал ответ на середине — сервер остановлен или перезапущен?")
+	observer{u}.Log(pipeline.Good, "Коммит 3f9c2ab в zigorminsk-debug/calc (main) (без сборки): 6 файлов — wip: Каркас калькулятора")
+	out := pipeline.Outcome{
+		RepoURL: "https://github.com/zigorminsk-debug/calc", Branch: "main", Attempts: 1,
+		LogURL: "https://github.com/zigorminsk-debug/calc/blob/main/.kolibri/worklog.md",
+	}
+	u.finishRun(out, &pipeline.InterruptedError{Err: errors.New("Колибри оборвал ответ на середине — сервер остановлен или перезапущен?"), Saved: 6})
+	if !u.banner.Visible() || u.running || u.runBtn.Text != "Запустить" {
+		t.Errorf("after an interrupted reply: banner=%v running=%v button=%q", u.banner.Visible(), u.running, u.runBtn.Text)
+	}
+	if got := bannerText(u); !strings.Contains(got, "Ответ модели прервался") || !strings.Contains(got, "Готовые файлы (6) сохранены") {
+		t.Errorf("banner = %q", got)
+	}
+	snap(t, win, "30-interrupted")
+
+	if !u.journal.fileBtn.Visible() {
+		t.Fatal("the journal must offer its file on disk")
+	}
+	test.Tap(u.journal.fileBtn)
+	if opened != filepath.Dir(logPath) {
+		t.Errorf("opened %q", opened)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"! Ответ модели прервался: Колибри оборвал", "✓ Коммит 3f9c2ab", "запустите задачу снова"} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("log file lacks %q:\n%s", want, data)
+		}
+	}
+
+	// A green stage of an unfinished project.
+	u.running = true
+	out.Next = "- экран истории\n- сохранение в файл"
+	out.Dir = filepath.Join("C:", "Users", "igor", "KolibriForge", "calc", "build-8")
+	out.RunURL = "https://github.com/zigorminsk-debug/calc/actions/runs/1008"
+	u.finishRun(out, nil)
+	if got := bannerText(u); !strings.Contains(got, "Этап собран, работа не окончена") || !strings.Contains(got, "запустите задачу снова") {
+		t.Errorf("banner = %q", got)
+	}
+	snap(t, win, "31-stage-done")
+}
+
+// bannerText collects the text of the result banner.
+func bannerText(u *UI) string {
+	var b strings.Builder
+	var rec func(o fyne.CanvasObject)
+	rec = func(o fyne.CanvasObject) {
+		switch v := o.(type) {
+		case *canvas.Text:
+			b.WriteString(v.Text + "\n")
+		case *widget.Label:
+			b.WriteString(v.Text + "\n")
+		case *fyne.Container:
+			for _, child := range v.Objects {
+				rec(child)
+			}
+		case fyne.Widget:
+			for _, child := range test.WidgetRenderer(v).Objects() {
+				rec(child)
+			}
+		}
+	}
+	rec(u.banner)
+	return b.String()
 }

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -26,6 +28,7 @@ import (
 	"github.com/zigorminsk-debug/kolibri/internal/config"
 	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
 	"github.com/zigorminsk-debug/kolibri/internal/pipeline"
+	"github.com/zigorminsk-debug/kolibri/internal/runlog"
 	"github.com/zigorminsk-debug/kolibri/internal/workflow"
 )
 
@@ -40,12 +43,21 @@ type UI struct {
 	// Save persists settings; replaced in tests.
 	Save func(config.Config) error
 
+	// Test hooks: stand-ins for api.github.com and github.com.
+	ghBaseURL    string
+	oauthBaseURL string
+
 	// header
 	llmChip *chip
 	ghChip  *chip
 
+	// dialogs currently open (kept for tests)
+	authDialog *dialog.CustomDialog
+	repoDialog *dialog.CustomDialog
+
 	// task form
 	repo      *widget.Entry
+	repoPick  *widget.Button
 	branch    *widget.Entry
 	kind      *widget.Select
 	targets   map[string]*widget.Check
@@ -81,10 +93,24 @@ type UI struct {
 	stage    pipeline.Stage
 	stopTick chan struct{}
 
+	// Log is the application's log file; nil writes nothing. Set it
+	// before Start.
+	Log *runlog.Log
+
+	// runUI replaces fyne.Do in tests, where the driver has no UI goroutine
+	// and updates from parallel requests would otherwise overlap.
+	runUI func(func())
+	// bg counts background requests, so tests can wait for them.
+	bg sync.WaitGroup
+	// deviceSleep replaces the pause between sign-in polls in tests.
+	deviceSleep func(context.Context, time.Duration) error
+
 	// what the connection checks found
-	models    []colibri.Model
-	llmOK     bool
-	ghOK      bool
+	models []colibri.Model
+	llmOK  bool
+	ghOK   bool
+	// ghProblem is why GitHub needs a new sign-in ("" when it does not).
+	ghProblem string
 	checkSeq  int
 	kindInfos []workflow.Info
 }
@@ -95,8 +121,29 @@ func New(app fyne.App, win fyne.Window, cfg config.Config) *UI {
 	u := &UI{app: app, win: win, cfg: cfg, kindInfos: workflow.Kinds()}
 	u.Save = func(c config.Config) error { return c.Save() }
 	win.SetContent(u.layout())
+	u.journal.sink = func(level pipeline.Level, msg string, at time.Time) {
+		u.Log.Line(at, levelMarks[level], msg)
+	}
 	u.loadForm()
 	return u
+}
+
+// do hands a UI update from a background request to the UI goroutine.
+func (u *UI) do(fn func()) {
+	if u.runUI != nil {
+		u.runUI(fn)
+		return
+	}
+	fyne.Do(fn)
+}
+
+// spawn runs a network request off the UI goroutine.
+func (u *UI) spawn(fn func()) {
+	u.bg.Add(1)
+	go func() {
+		defer u.bg.Done()
+		fn()
+	}()
 }
 
 // Start runs the connection checks and the redraw ticker.
@@ -160,7 +207,14 @@ func (u *UI) header() fyne.CanvasObject {
 	sub.Truncation = fyne.TextTruncateEllipsis
 
 	u.llmChip = newChip("Колибри · проверка…", toneBusy, u.CheckConnections)
-	u.ghChip = newChip("GitHub · проверка…", toneBusy, u.CheckConnections)
+	u.ghChip = newChip("GitHub · проверка…", toneBusy, func() {
+		// A chip that reports a token problem leads straight to the cure.
+		if u.ghProblem != "" && !u.running {
+			u.showAuth(u.ghProblem, nil)
+			return
+		}
+		u.CheckConnections()
+	})
 	settings := widget.NewButtonWithIcon("Настройки", theme.SettingsIcon(), u.showSettings)
 
 	left := container.NewHBox(fixed(34, 34, logo), gap(4, 0), container.NewCenter(title))
@@ -175,6 +229,8 @@ func (u *UI) formPanel() fyne.CanvasObject {
 	u.repo = widget.NewEntry()
 	u.repo.SetPlaceHolder("владелец/название")
 	u.repo.OnChanged = func(string) { u.clearProblem() }
+	u.repoPick = iconButton(theme.SearchIcon(), u.showRepoPicker)
+	u.repo.ActionItem = u.repoPick
 	u.branch = widget.NewEntry()
 	u.branch.SetPlaceHolder("основная")
 
@@ -249,6 +305,7 @@ func (u *UI) progressPanel() fyne.CanvasObject {
 	u.banner.Hide()
 
 	u.journal = newJournal(u.copyText)
+	u.journal.openDir = u.openFolder
 	u.stream = newStreamView(u.copyText)
 	u.files = newFilesView()
 	u.build = newBuildView(u.openURL)
@@ -387,7 +444,7 @@ func (u *UI) setFormEnabled(on bool) {
 		Enable()
 		Disable()
 	}
-	controls := []toggler{u.repo, u.branch, u.kind, u.prompt, u.fixes, u.private, u.release}
+	controls := []toggler{u.repo, u.repoPick, u.branch, u.kind, u.prompt, u.fixes, u.private, u.release}
 	for _, c := range controls {
 		if on {
 			c.Enable()
@@ -417,8 +474,8 @@ func (u *UI) onRunTapped() {
 		return
 	}
 	if u.cfg.Token() == "" {
-		u.showProblem("Нужен токен GitHub. Откройте «Настройки» и вставьте его.")
-		u.showSettings()
+		u.showProblem("Нужен токен GitHub: без него код не отправить.")
+		u.showAuth("Чтобы отправить код в GitHub, войдите в него.", nil)
 		return
 	}
 	u.saveForm()
@@ -461,7 +518,7 @@ func (u *UI) clients() (*colibri.Client, *ghapi.Client) {
 		APIKey:      u.cfg.ColibriKey,
 		IdleTimeout: time.Duration(u.cfg.IdleTimeoutMin) * time.Minute,
 	}
-	return llm, &ghapi.Client{Token: u.cfg.Token()}
+	return llm, u.github(u.cfg.Token())
 }
 
 func (u *UI) startRun(task pipeline.Task) {
@@ -486,6 +543,12 @@ func (u *UI) startRun(task pipeline.Task) {
 	u.runBtn.SetIcon(theme.MediaStopIcon())
 	u.runBtn.Importance = widget.DangerImportance
 	u.runBtn.Refresh()
+
+	u.Log.Start(u.started, task.Owner+"/"+task.Repo, task.Branch, task.Model, task.Prompt)
+	u.journal.logDir = ""
+	if p := u.Log.Path(); p != "" {
+		u.journal.logDir = filepath.Dir(p)
+	}
 
 	llm, gh := u.clients()
 	runner := &pipeline.Runner{LLM: llm, GH: gh, Obs: observer{u}}
@@ -512,14 +575,24 @@ func (u *UI) finishRun(out pipeline.Outcome, err error) {
 	u.timer.Refresh()
 
 	var failed *pipeline.BuildFailedError
+	var cut *pipeline.InterruptedError
 	switch {
 	case err == nil:
 		u.setStages(pipeline.StageDeliver+1, false)
 		u.showResult(out)
+	case errors.As(err, &cut):
+		u.setStages(u.stage, true)
+		u.journal.add(pipeline.Warn, capitalize(err.Error())+".", time.Now())
+		u.showBanner(toneBusy, "Ответ модели прервался",
+			fmt.Sprintf("Готовые файлы (%d) сохранены в репозитории, ход работы записан в журнал. Запустите задачу снова — модель продолжит с этого места.", cut.Saved), out, false)
 	case errors.Is(err, context.Canceled):
 		u.setStages(u.stage, true)
 		u.journal.add(pipeline.Warn, "Остановлено. Если сборка уже началась, она продолжится на GitHub.", time.Now())
-		u.showBanner(toneBusy, "Остановлено", "Задача прервана. Начатое на GitHub не отменяется.", out, false)
+		detail := "Задача прервана. Начатое на GitHub не отменяется."
+		if out.LogURL != "" {
+			detail = "Задача прервана. Всё, что модель успела сдать, сохранено в репозитории и записано в журнал работы."
+		}
+		u.showBanner(toneBusy, "Остановлено", detail, out, false)
 	case errors.As(err, &failed):
 		u.setStages(pipeline.StageBuild, true)
 		u.journal.add(pipeline.Bad, capitalize(err.Error())+".", time.Now())
@@ -567,7 +640,12 @@ func (u *UI) showResult(out pipeline.Outcome) {
 	} else {
 		parts = append(parts, "файлы — на странице сборки в GitHub")
 	}
-	u.showBanner(toneGood, title, capitalize(strings.Join(parts, ", ")), out, true)
+	detail := capitalize(strings.Join(parts, ", "))
+	if out.Next != "" {
+		title = "Этап собран, работа не окончена"
+		detail += ". Модель записала в журнал работы, что осталось сделать: запустите задачу снова, чтобы продолжить."
+	}
+	u.showBanner(toneGood, title, detail, out, true)
 }
 
 // showBanner puts the outcome of a run above the tabs with the actions
@@ -680,11 +758,11 @@ func (u *UI) CheckConnections() {
 	llm, gh := u.clients()
 	wanted := u.cfg.Model
 
-	go func() {
+	u.spawn(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		models, err := llm.Models(ctx)
-		fyne.Do(func() {
+		u.do(func() {
 			if seq != u.checkSeq {
 				return
 			}
@@ -708,22 +786,24 @@ func (u *UI) CheckConnections() {
 				u.llmChip.Set(label, toneGood)
 			}
 		})
-	}()
+	})
 
 	if gh.Token == "" {
 		u.ghOK = false
-		u.ghChip.Set("GitHub · нужен токен", toneBad)
+		u.ghProblem = "Токен GitHub не задан. Войдите, чтобы программа могла отправлять код и следить за сборкой."
+		u.ghChip.Set("GitHub · войти", toneBad)
 		return
 	}
-	go func() {
+	u.spawn(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		user, err := gh.CurrentUser(ctx)
-		fyne.Do(func() {
+		u.do(func() {
 			if seq != u.checkSeq {
 				return
 			}
 			u.ghOK = err == nil
+			u.ghProblem = authReason(err)
 			var api *ghapi.APIError
 			switch {
 			case errors.As(err, &api) && api.Status == 401:
@@ -736,7 +816,7 @@ func (u *UI) CheckConnections() {
 				u.ghChip.Set("GitHub · "+shorten(user.Login, 22), toneGood)
 			}
 		})
-	}()
+	})
 }
 
 func shorten(s string, max int) string {

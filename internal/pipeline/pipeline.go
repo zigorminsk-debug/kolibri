@@ -18,6 +18,7 @@ import (
 	"github.com/zigorminsk-debug/kolibri/internal/colibri"
 	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
 	"github.com/zigorminsk-debug/kolibri/internal/workflow"
+	"github.com/zigorminsk-debug/kolibri/internal/worklog"
 )
 
 // Stage is a step of the pipeline as the user sees it.
@@ -107,7 +108,27 @@ type Outcome struct {
 	// Attempts is how many generations it took.
 	Attempts int
 	Kind     workflow.Kind
+	// Next is the model's note on what is left to do, "" when it considers
+	// the task finished.
+	Next string
+	// LogURL is the work log in the repository, "" before the first commit.
+	LogURL string
 }
+
+// InterruptedError means the model's reply broke off (the server stopped,
+// the connection dropped, the model fell silent) after some files had
+// already arrived. Those files are committed; a new run continues from them.
+type InterruptedError struct {
+	Err   error
+	Saved int
+}
+
+func (e *InterruptedError) Error() string {
+	return fmt.Sprintf("%v. Полученное сохранено в репозитории (%d %s) и записано в журнал работы — запустите задачу снова, работа продолжится с этого места",
+		e.Err, e.Saved, plural(e.Saved, "файл", "файла", "файлов"))
+}
+
+func (e *InterruptedError) Unwrap() error { return e.Err }
 
 // BuildFailedError means the build is still red after every allowed attempt.
 type BuildFailedError struct {
@@ -173,11 +194,45 @@ type state struct {
 	kind     workflow.Kind
 	summary  string
 	attempts int
+
+	// worklog is the project's work log (worklog.Path), kept apart from
+	// the project files; logged is true once this run wrote to it.
+	worklog string
+	logged  bool
+	// pending is true while commits made without a build wait for one.
+	pending bool
+	// next is the model's latest note on what remains.
+	next string
+	// lastError is the most telling line of the latest build failure.
+	lastError string
+}
+
+// maxParts bounds how many replies in a row one generation may take when
+// each of them is cut short.
+const maxParts = 6
+
+// generation is what one model reply turned into.
+type generation struct {
+	changes []ghapi.Change
+	files   []string // "+ path", "~ path", "- path" — for the work log
+	// partial says why the reply is incomplete, "" when it is whole.
+	partial string
+	// resume tells the model how to go on in the next request.
+	resume string
+	// broken is the stream error that cut the reply, when there was one.
+	broken error
+}
+
+// commitKind says what a commit is for.
+type commitKind struct {
+	fix     bool // a reply to a failed build
+	resumed bool // a reply that continues an unfinished one
+	partial bool // an unfinished reply: saved, but not built
 }
 
 // Run executes a task. It returns when the build is green and downloaded,
 // when it gives up, or when ctx is cancelled.
-func (r *Runner) Run(ctx context.Context, task Task) (Outcome, error) {
+func (r *Runner) Run(ctx context.Context, task Task) (out Outcome, err error) {
 	if strings.TrimSpace(task.Prompt) == "" {
 		return Outcome{}, errors.New("опишите задачу")
 	}
@@ -191,26 +246,60 @@ func (r *Runner) Run(ctx context.Context, task Task) (Outcome, error) {
 	if err := r.prepare(ctx, st); err != nil {
 		return Outcome{}, err
 	}
-	out := Outcome{RepoURL: st.repo.HTMLURL, Branch: st.branch}
+	out = Outcome{RepoURL: st.repo.HTMLURL, Branch: st.branch}
+	st.takeLog()
+	if n := worklog.Entries(st.worklog); n > 0 {
+		r.logf(Info, "В репозитории есть журнал работы (%d %s) — модель продолжит по нему", n, plural(n, "запись", "записи", "записей"))
+	}
+	// However the run ends, the log in the repository says how.
+	defer func() { r.closeLog(ctx, st, &out, err) }()
 
 	failure := ""
 	for attempt := 1; ; attempt++ {
 		st.attempts = attempt
 		out.Attempts = attempt
 
-		r.Obs.Stage(StageGenerate, attempt, total)
-		changes, err := r.generate(ctx, st, failure)
-		if err != nil {
-			return out, err
+		// One generation is usually one reply. A reply that is cut short
+		// is saved without a build and continued in a fresh request, so a
+		// project larger than the model's reply still gets written.
+		var gen generation
+		resume := ""
+		for part := 1; ; part++ {
+			r.Obs.Stage(StageGenerate, attempt, total)
+			gen, err = r.generate(ctx, st, failure, resume)
+			if err != nil {
+				return out, err
+			}
+			if gen.partial == "" {
+				break
+			}
+			r.Obs.Stage(StageCommit, attempt, total)
+			r.logf(Warn, "Ответ неполный: %s. Сохраняю готовые файлы в репозиторий без запуска сборки", gen.partial)
+			if err := r.commit(ctx, st, gen, commitKind{fix: attempt > 1, resumed: resume != "", partial: true}); err != nil {
+				return out, err
+			}
+			out.CommitSHA = st.head.Commit
+			out.CommitURL = st.repo.HTMLURL + "/commit/" + st.head.Commit
+			out.LogURL = st.logURL()
+			if gen.broken != nil {
+				return out, &InterruptedError{Err: gen.broken, Saved: len(gen.changes)}
+			}
+			if part >= maxParts {
+				return out, fmt.Errorf("задача не уложилась в %d ответов подряд: каждый обрывался. Сделанное сохранено в репозитории и записано в журнал работы — запустите задачу снова, чтобы продолжить, или увеличьте «Макс. токенов ответа»", maxParts)
+			}
+			r.logf(Info, "Продолжаю с чистым контекстом: модель получит сохранённые файлы и журнал работы (часть %d)", part+1)
+			resume = gen.resume
 		}
 
 		r.Obs.Stage(StageCommit, attempt, total)
-		if err := r.commit(ctx, st, changes, attempt > 1); err != nil {
+		if err := r.commit(ctx, st, gen, commitKind{fix: attempt > 1, resumed: resume != ""}); err != nil {
 			return out, err
 		}
 		out.CommitSHA = st.head.Commit
 		out.CommitURL = st.repo.HTMLURL + "/commit/" + st.head.Commit
 		out.Kind = st.kind
+		out.Next = st.next
+		out.LogURL = st.logURL()
 
 		r.Obs.Stage(StageBuild, attempt, total)
 		runs, err := r.build(ctx, st)
@@ -223,6 +312,10 @@ func (r *Runner) Run(ctx context.Context, task Task) (Outcome, error) {
 		if allGreen(runs) {
 			r.Obs.Stage(StageDeliver, attempt, total)
 			r.deliver(ctx, st, runs, &out)
+			if st.next != "" {
+				r.logf(Warn, "Модель считает задачу незаконченной. Осталось: %s. Запустите задачу снова — модель продолжит по журналу работы",
+					clip(strings.Join(strings.Fields(st.next), " "), 400))
+			}
 			return out, nil
 		}
 
@@ -235,6 +328,70 @@ func (r *Runner) Run(ctx context.Context, task Task) (Outcome, error) {
 		}
 		r.logf(Warn, "Сборка не прошла. Отправляю журнал ошибок модели — исправление %d из %d", attempt, task.MaxFixes)
 	}
+}
+
+// takeLog moves the work log out of the project files: the model sees it
+// as history, not as a file it may rewrite.
+func (st *state) takeLog() {
+	st.worklog = st.project[worklog.Path]
+	delete(st.project, worklog.Path)
+	delete(st.opaque, worklog.Path)
+}
+
+func (st *state) logURL() string {
+	if !st.logged {
+		return ""
+	}
+	return st.repo.HTMLURL + "/blob/" + st.branch + "/" + worklog.Path
+}
+
+// closeLog writes how the run ended into the work log. The commit is marked
+// [skip ci]: it changes no code and must not start another build.
+func (r *Runner) closeLog(ctx context.Context, st *state, out *Outcome, runErr error) {
+	if !st.logged {
+		return
+	}
+	var failed *BuildFailedError
+	var cut *InterruptedError
+	var note string
+	switch {
+	case runErr == nil:
+		note = "сборка прошла"
+		if out.RunURL != "" {
+			note += " — " + out.RunURL
+		}
+		if out.ReleaseURL != "" {
+			note += "; релиз " + out.ReleaseURL
+		}
+	case errors.As(runErr, &failed):
+		note = failed.Error()
+		if st.lastError != "" {
+			note += ". Последняя ошибка: " + clip(st.lastError, 300)
+		}
+	case errors.Is(runErr, context.Canceled):
+		note = "работа остановлена пользователем"
+	case errors.As(runErr, &cut):
+		note = "ответ модели прервался: " + clip(cut.Err.Error(), 300)
+	default:
+		note = "работа прервана: " + clip(runErr.Error(), 400)
+	}
+
+	// A cancelled run still gets its line: use a context of its own.
+	if ctx.Err() != nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	doc := worklog.Note(st.worklog, note)
+	head, err := r.GH.Commit(ctx, st.task.Owner, st.task.Repo, st.branch, st.head,
+		"docs: итог в журнале работы\n\n"+note+"\n\n[skip ci]",
+		[]ghapi.Change{{Path: worklog.Path, Content: []byte(doc), Mode: "100644"}})
+	if err != nil {
+		r.logf(Warn, "Не удалось записать итог в журнал работы: %v", err)
+		return
+	}
+	st.worklog, st.head = doc, head
+	r.logf(Info, "Итог записан в журнал работы: %s", st.logURL())
 }
 
 func (r *Runner) prepare(ctx context.Context, st *state) error {
@@ -475,28 +632,40 @@ func (st *state) opaquePaths() []string {
 
 // generate asks the model for code and turns the reply into commit changes.
 // failure is the build log of the previous attempt, "" on the first one.
-func (r *Runner) generate(ctx context.Context, st *state, failure string) ([]ghapi.Change, error) {
+// generate asks the model for code and applies the reply to the in-memory
+// project. failure is the build log to fix, resume the note on continuing
+// a reply that was cut short; both may be empty.
+func (r *Runner) generate(ctx context.Context, st *state, failure, resume string) (generation, error) {
+	var none generation
 	task := st.task
 	kind := st.promptKind()
-	fixed := len(systemPrompt) + len(task.Prompt) + len(failure) + 1500
+	// The log gets a small, fixed share of the context: enough for the
+	// latest steps and the plan.
+	history := worklog.Tail(st.worklog, logShare(st.ctxLen))
+	fixed := len(systemPrompt) + len(task.Prompt) + len(failure) + len(history) + len(resume) + 1500
 	budget := fileBudget(st.ctxLen, task.MaxTokens, fixed)
 
 	var reply string
 	var cutOff bool
+	var broken error
 	for shrink := 0; ; shrink++ {
 		var messages []colibri.Message
 		title := "Задача"
+		extra := promptExtra{history: history, resume: resume}
 		if failure == "" {
-			messages = taskMessages(task, kind, st.project, st.opaquePaths(), budget)
+			messages = taskMessages(task, kind, st.project, st.opaquePaths(), budget, extra)
 		} else {
 			title = fmt.Sprintf("Исправление сборки (попытка %d)", st.attempts)
-			messages = fixMessages(task, kind, st.project, st.opaquePaths(), budget, failure)
+			messages = fixMessages(task, kind, st.project, st.opaquePaths(), budget, failure, extra)
+		}
+		if resume != "" {
+			title += " — продолжение"
 		}
 		r.Obs.ModelStart(title)
 		r.logf(Info, "Отправляю запрос модели %s (%s)", st.model, sizeText(messagesLen(messages)))
 
 		var err error
-		reply, cutOff, err = r.ask(ctx, st, messages)
+		reply, cutOff, broken, err = r.ask(ctx, st, messages)
 		if err == nil {
 			break
 		}
@@ -508,11 +677,11 @@ func (r *Runner) generate(ctx context.Context, st *state, failure string) ([]gha
 			r.logf(Warn, "Запрос не поместился в контекст модели — сокращаю исходники и повторяю")
 			continue
 		}
-		return nil, err
+		return none, err
 	}
 
 	parsed, perr := codeparse.Parse(reply, cutOff)
-	if errors.Is(perr, codeparse.ErrNoFiles) && !parsed.Truncated && ctx.Err() == nil {
+	if errors.Is(perr, codeparse.ErrNoFiles) && !parsed.Truncated && broken == nil && ctx.Err() == nil {
 		r.logf(Warn, "В ответе нет файлов в нужном формате — прошу модель оформить ответ заново")
 		messages := []colibri.Message{
 			{Role: "system", Content: systemPrompt},
@@ -524,20 +693,37 @@ func (r *Runner) generate(ctx context.Context, st *state, failure string) ([]gha
 		messages = append(messages, colibri.Message{Role: "user", Content: reformatRequest})
 		r.Obs.ModelStart("Повтор: ответ в нужном формате")
 		var err error
-		reply, cutOff, err = r.ask(ctx, st, messages)
+		reply, cutOff, broken, err = r.ask(ctx, st, messages)
 		if err != nil {
-			return nil, err
+			return none, err
 		}
 		parsed, perr = codeparse.Parse(reply, cutOff)
 	}
 	if perr != nil {
-		if parsed.Truncated {
-			return nil, fmt.Errorf("ответ модели оборвался на первом же файле (%s): не хватило лимита токенов. Увеличьте «Макс. токенов ответа» или контекст сервера", parsed.TruncatedPath)
+		if broken != nil {
+			// Nothing whole arrived before the stream broke.
+			return none, broken
 		}
-		return nil, errors.New("модель не вернула файлы в нужном формате. Попробуйте уточнить задачу или выбрать другую модель")
+		if parsed.Truncated {
+			return none, fmt.Errorf("ответ модели оборвался на первом же файле (%s): не хватило лимита токенов. Увеличьте «Макс. токенов ответа» или контекст сервера", parsed.TruncatedPath)
+		}
+		return none, errors.New("модель не вернула файлы в нужном формате. Попробуйте уточнить задачу или выбрать другую модель")
 	}
-	if parsed.Truncated {
-		r.logf(Warn, "Ответ оборвался на файле %s — он пропущен. Если сборка упадёт, модель допишет его при исправлении", parsed.TruncatedPath)
+
+	gen := generation{broken: broken}
+	if cutOff {
+		// The reply did not end by itself: what is whole gets saved, the
+		// rest is asked for again.
+		if parsed.Truncated {
+			gen.partial = "ответ оборвался на файле " + parsed.TruncatedPath
+			gen.resume = "Your previous reply was cut off in the middle of the file " + parsed.TruncatedPath +
+				". That file was not saved; every file completed before it is committed and shown below. " +
+				"Do not repeat finished files: send " + parsed.TruncatedPath + " in full and then everything else that is still missing."
+		} else {
+			gen.partial = "ответ оборвался, не дойдя до конца"
+			gen.resume = "Your previous reply was cut off before it ended. Every file completed in it is committed and shown below. " +
+				"Do not repeat finished files: send only what is still missing."
+		}
 	}
 	for _, p := range parsed.Rejected {
 		r.logf(Warn, "Пропущен недопустимый путь из ответа: %s", clip(p, 80))
@@ -552,8 +738,8 @@ func (r *Runner) generate(ctx context.Context, st *state, failure string) ([]gha
 	var changes []ghapi.Change
 	var view []FileChange
 	for _, f := range parsed.Files {
-		if strings.HasPrefix(f.Path, ".github/") {
-			r.logf(Warn, "Модель прислала %s — файлы в .github/ ведёт приложение, пропускаю", f.Path)
+		if strings.HasPrefix(f.Path, ".github/") || strings.HasPrefix(f.Path, worklog.Dir) {
+			r.logf(Warn, "Модель прислала %s — файлы в .github/ и .kolibri/ ведёт приложение, пропускаю", f.Path)
 			continue
 		}
 		old, existed := st.project[f.Path]
@@ -580,12 +766,22 @@ func (r *Runner) generate(ctx context.Context, st *state, failure string) ([]gha
 		changes = append(changes, ghapi.Change{Path: f.Path, Content: []byte(f.Content), Mode: fileMode(st.modes[f.Path], f.Content)})
 		view = append(view, FileChange{Path: f.Path, Content: f.Content, Status: status})
 	}
-	if len(changes) == 0 {
-		if failure != "" {
-			return nil, errors.New("модель не изменила ни одного файла — исправить сборку не получилось")
-		}
-		return nil, errors.New("модель не предложила изменений: в ответе нет новых или изменённых файлов")
+	switch {
+	case len(changes) > 0:
+	case gen.broken != nil:
+		return none, gen.broken
+	case gen.partial != "":
+		return none, errors.New("ответ модели снова оборвался, и в нём нет ни одного нового файла: дальше так не продвинуться. Увеличьте «Макс. токенов ответа» или контекст сервера Колибри")
+	case st.pending:
+		// Earlier parts are committed but not built: this reply adds
+		// nothing, so the build runs on what is there.
+		r.logf(Info, "Модель сообщила, что дописывать нечего — собираю сохранённое")
+	case failure != "":
+		return none, errors.New("модель не изменила ни одного файла — исправить сборку не получилось")
+	default:
+		return none, errors.New("модель не предложила изменений: в ответе нет новых или изменённых файлов")
 	}
+	st.next = parsed.Next
 
 	// Decide the stack and make sure the matching workflow is in place.
 	if task.Kind != "" && task.Kind != workflow.Auto {
@@ -604,7 +800,7 @@ func (r *Runner) generate(ctx context.Context, st *state, failure string) ([]gha
 		Kind: st.kind, Branch: st.branch, AppName: task.Repo, Targets: task.Targets, Release: task.Release,
 	})
 	if err != nil {
-		return nil, err
+		return none, err
 	}
 	if st.project[workflow.Path] != wf {
 		status := "new"
@@ -619,11 +815,37 @@ func (r *Runner) generate(ctx context.Context, st *state, failure string) ([]gha
 
 	sort.SliceStable(view, func(i, j int) bool { return view[i].Path < view[j].Path })
 	r.Obs.Files(view)
-	return changes, nil
+	for _, v := range view {
+		if v.Path == workflow.Path {
+			continue // the application's own file is not the model's work
+		}
+		mark := "~ "
+		switch v.Status {
+		case "new":
+			mark = "+ "
+		case "deleted":
+			mark = "- "
+		}
+		gen.files = append(gen.files, mark+v.Path)
+	}
+	gen.changes = changes
+	return gen, nil
+}
+
+// logShare is how many characters of the work log go into a request.
+func logShare(contextTokens int) int {
+	if contextTokens <= 0 {
+		contextTokens = 16384
+	}
+	share := contextTokens / 4 // about a twelfth of the context, in characters
+	return min(max(share, 1500), 8000)
 }
 
 // ask streams one reply, continuing it when the token limit cuts it short.
-func (r *Runner) ask(ctx context.Context, st *state, messages []colibri.Message) (reply string, cutOff bool, err error) {
+// cutOff is true when the reply did not end by itself. broken carries the
+// stream error when the reply broke off after some text had arrived: the
+// caller saves what is whole before reporting it.
+func (r *Runner) ask(ctx context.Context, st *state, messages []colibri.Message) (reply string, cutOff bool, broken, err error) {
 	req := colibri.ChatRequest{Model: st.model, Messages: messages, Temperature: st.task.Temperature, MaxTokens: st.task.MaxTokens}
 	onDelta := func(d colibri.Delta) {
 		if d.Reasoning != "" {
@@ -636,7 +858,11 @@ func (r *Runner) ask(ctx context.Context, st *state, messages []colibri.Message)
 	started := time.Now()
 	res, err := r.LLM.ChatStream(ctx, req, onDelta)
 	if err != nil {
-		return "", false, err
+		if ctx.Err() != nil || strings.TrimSpace(res.Content) == "" {
+			return "", false, nil, err
+		}
+		r.logf(Warn, "Ответ модели прервался: %v", err)
+		return res.Content, true, err, nil
 	}
 	reply = res.Content
 	tokens := res.Usage.CompletionTokens
@@ -654,11 +880,15 @@ func (r *Runner) ask(ctx context.Context, st *state, messages []colibri.Message)
 		next, err := r.LLM.ChatStream(ctx, req, onDelta)
 		if err != nil {
 			if ctx.Err() != nil {
-				return "", false, ctx.Err()
+				return "", false, nil, ctx.Err()
 			}
-			// No room left in the context: work with what arrived.
-			r.logf(Warn, "Продолжить ответ не удалось: %v", err)
-			return reply, true, nil
+			// No room left in the context, or the stream broke: work with
+			// what arrived. The rest is asked for in a fresh request.
+			r.logf(Warn, "Продолжить ответ в том же контексте не удалось: %v", err)
+			if colibri.ContextExceeded(err) {
+				return partial + next.Content, true, nil, nil
+			}
+			return partial + next.Content, true, err, nil
 		}
 		reply = partial + next.Content
 		tokens += next.Usage.CompletionTokens
@@ -671,7 +901,7 @@ func (r *Runner) ask(ctx context.Context, st *state, messages []colibri.Message)
 	} else {
 		r.logf(Info, "Ответ получен: %s за %s", sizeText(len(reply)), durationText(elapsed))
 	}
-	return reply, res.FinishReason == "length", nil
+	return reply, res.FinishReason == "length", nil, nil
 }
 
 func messagesLen(messages []colibri.Message) int {
@@ -693,22 +923,55 @@ func fileMode(existing, content string) string {
 	return "100644"
 }
 
-func (r *Runner) commit(ctx context.Context, st *state, changes []ghapi.Change, isFix bool) error {
+// commit writes one generation to the branch together with its entry in
+// the work log. A partial commit is marked [skip ci]: an unfinished project
+// would only fail the build.
+func (r *Runner) commit(ctx context.Context, st *state, gen generation, kind commitKind) error {
 	subject := st.summary
 	if subject == "" {
 		subject = clip(firstLine(st.task.Prompt), 72)
 	}
-	if isFix && !strings.HasPrefix(strings.ToLower(subject), "fix") {
+	switch {
+	case kind.partial:
+		subject = "wip: " + subject
+	case kind.fix && !strings.HasPrefix(strings.ToLower(subject), "fix"):
 		subject = "fix: " + subject
 	}
 	message := subject + "\n\n" + "Задача: " + clip(strings.TrimSpace(st.task.Prompt), 500) +
 		"\n\nСгенерировано моделью " + st.model + " через Kolibri Forge."
+	if kind.partial {
+		message += "\n\nОтвет модели неполный (" + gen.partial + "): файлы сохранены без запуска сборки.\n\n[skip ci]"
+	}
+
+	entry := worklog.Entry{
+		Time: time.Now(), Kind: "Задача", Model: st.model,
+		Summary: st.summary, Files: gen.files, Unfinished: gen.partial, Next: st.next,
+	}
+	if !st.logged {
+		// The task is written once per run; later entries belong to it.
+		entry.Task = st.task.Prompt
+	}
+	switch {
+	case kind.fix:
+		entry.Kind = fmt.Sprintf("Исправление сборки (попытка %d)", st.attempts)
+		entry.Reason = st.lastError
+	case kind.resumed:
+		entry.Kind = "Продолжение оборванного ответа"
+	}
+	if kind.fix && kind.resumed {
+		entry.Kind += ", продолжение"
+	}
+	doc := worklog.Append(st.worklog, entry)
+	changes := append(append([]ghapi.Change{}, gen.changes...),
+		ghapi.Change{Path: worklog.Path, Content: []byte(doc), Mode: "100644"})
 
 	head, err := r.GH.Commit(ctx, st.task.Owner, st.task.Repo, st.branch, st.head, message, changes)
 	if err != nil {
 		return err
 	}
 	st.head = head
+	st.worklog, st.logged = doc, true
+	st.pending = kind.partial
 	for _, ch := range changes {
 		if ch.Delete {
 			delete(st.modes, ch.Path)
@@ -720,8 +983,16 @@ func (r *Runner) commit(ctx context.Context, st *state, changes []ghapi.Change, 
 	if len(short) > 7 {
 		short = short[:7]
 	}
-	r.logf(Good, "Коммит %s в %s/%s (%s): %d %s — %s", short, st.task.Owner, st.task.Repo, st.branch,
-		len(changes), plural(len(changes), "файл", "файла", "файлов"), subject)
+	n := len(gen.changes)
+	what := fmt.Sprintf("%d %s", n, plural(n, "файл", "файла", "файлов"))
+	if n == 0 {
+		what = "только журнал работы"
+	}
+	note := ""
+	if kind.partial {
+		note = " (без сборки)"
+	}
+	r.logf(Good, "Коммит %s в %s/%s (%s)%s: %s — %s", short, st.task.Owner, st.task.Repo, st.branch, note, what, subject)
 	return nil
 }
 

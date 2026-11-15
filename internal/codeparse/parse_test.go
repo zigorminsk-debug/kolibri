@@ -164,3 +164,42 @@ func TestCleanPath(t *testing.T) {
 		}
 	}
 }
+
+func TestParseNextBlock(t *testing.T) {
+	reply := "SUMMARY: Каркас приложения\n\n=== FILE: main.go ===\npackage main\n=== END FILE ===\n\n" +
+		"=== NEXT ===\n- экран настроек\n- сохранение в файл\n=== END NEXT ===\n"
+	res, err := Parse(reply, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Files) != 1 || res.Files[0].Content != "package main\n" {
+		t.Errorf("files = %+v", res.Files)
+	}
+	if res.Next != "- экран настроек\n- сохранение в файл" {
+		t.Errorf("Next = %q", res.Next)
+	}
+
+	// A note that says there is nothing left is not a plan.
+	for _, body := range []string{"", "none", "- Nothing.", "нет", "-"} {
+		res, err := Parse("=== FILE: a.txt ===\nx\n=== END FILE ===\n=== NEXT ===\n"+body+"\n=== END NEXT ===\n", false)
+		if err != nil || res.Next != "" {
+			t.Errorf("body %q: Next = %q, err = %v", body, res.Next, err)
+		}
+	}
+
+	// The note may be cut off, or a file may follow it.
+	res, _ = Parse("=== FILE: a.txt ===\nx\n=== END FILE ===\n=== NEXT ===\n- тесты", true)
+	if res.Next != "- тесты" || res.Truncated {
+		t.Errorf("cut note: %+v", res)
+	}
+	res, _ = Parse("=== NEXT ===\n- тесты\n=== FILE: a.txt ===\nx\n=== END FILE ===\n", false)
+	if res.Next != "- тесты" || len(res.Files) != 1 {
+		t.Errorf("note before file: %+v", res)
+	}
+
+	// Inside a file the marker is just content.
+	res, _ = Parse("=== FILE: doc.md ===\n=== NEXT ===\ntext\n=== END FILE ===\n", false)
+	if res.Next != "" || res.Files[0].Content != "=== NEXT ===\ntext\n" {
+		t.Errorf("marker inside a file: %+v", res)
+	}
+}

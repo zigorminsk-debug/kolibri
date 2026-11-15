@@ -1,0 +1,2 @@
+# The installer script is UTF-8 with BOM and CRLF, as Inno Setup expects.
+installer/*.iss -text

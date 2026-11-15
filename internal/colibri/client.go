@@ -102,6 +102,11 @@ func ContextExceeded(err error) bool {
 	return errors.As(err, &api) && api.Code == "context_length_exceeded"
 }
 
+// ErrCutShort is returned, together with the text received so far, when the
+// server ends a streamed reply without finishing it — it was stopped or
+// restarted in the middle of a generation.
+var ErrCutShort = errors.New("Колибри оборвал ответ на середине — сервер остановлен или перезапущен?")
+
 // ErrIdle is returned when a stream stays silent longer than Client.IdleTimeout.
 var ErrIdle = errors.New("Колибри перестал отвечать: поток молчит дольше допустимого")
 
@@ -358,16 +363,23 @@ func (c *Client) ChatStream(ctx context.Context, req ChatRequest, onDelta func(D
 		}
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
-				if res.FinishReason == "" && content.Len() == 0 {
+				if res.FinishReason != "" {
+					// Some servers leave out the closing [DONE].
+					return finish(), nil
+				}
+				if content.Len() == 0 {
 					return finish(), errors.New("Колибри закрыл соединение, не прислав ответ")
 				}
-				return finish(), nil
+				return finish(), ErrCutShort
 			}
 			if watch.fired() {
 				return finish(), ErrIdle
 			}
 			if ctx.Err() != nil {
 				return finish(), ctx.Err()
+			}
+			if content.Len() > 0 {
+				return finish(), fmt.Errorf("%w (%v)", ErrCutShort, readErr)
 			}
 			return finish(), c.friendly(readErr)
 		}

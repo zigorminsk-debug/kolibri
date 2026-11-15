@@ -25,6 +25,9 @@ type Config struct {
 
 	// GitHub.
 	GitHubToken string `json:"github_token,omitempty"`
+	// GitHubClientID is the Client ID of the user's OAuth App. It switches
+	// on signing in through the browser; without it the app asks for a token.
+	GitHubClientID string `json:"github_client_id,omitempty"`
 
 	// Where finished builds are unpacked.
 	OutputDir string `json:"output_dir"`
@@ -137,6 +140,7 @@ func (c *Config) normalize() {
 	}
 	c.ColibriKey = strings.TrimSpace(c.ColibriKey)
 	c.GitHubToken = strings.TrimSpace(c.GitHubToken)
+	c.GitHubClientID = strings.TrimSpace(c.GitHubClientID)
 	c.Repo = strings.TrimSpace(c.Repo)
 	c.Branch = strings.TrimSpace(c.Branch)
 	if c.Temperature < 0 {

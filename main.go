@@ -3,11 +3,14 @@
 package main
 
 import (
+	"path/filepath"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/dialog"
 
 	"github.com/zigorminsk-debug/kolibri/internal/config"
+	"github.com/zigorminsk-debug/kolibri/internal/runlog"
 	"github.com/zigorminsk-debug/kolibri/internal/ui"
 )
 
@@ -24,6 +27,11 @@ func main() {
 	w.CenterOnScreen()
 
 	view := ui.New(a, w, cfg)
+	// The log lives next to the settings: it survives a change of the
+	// output folder and is not mixed with downloaded programs.
+	if path, err := config.Path(); err == nil {
+		view.Log = runlog.New(filepath.Join(filepath.Dir(path), "kolibri-forge.log"))
+	}
 	w.SetOnClosed(view.Stop)
 	view.Start()
 	if loadErr != nil {

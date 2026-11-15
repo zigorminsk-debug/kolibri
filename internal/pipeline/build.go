@@ -156,6 +156,8 @@ func (r *Runner) describeFailure(ctx context.Context, st *state, runs []RunStatu
 	}
 
 	var b strings.Builder
+	errorLine := "" // the first telling line, for the work log
+	defer func() { st.lastError = errorLine }()
 	seen := map[string]bool{}
 	budget := maxFailureChars
 	if st.ctxLen > 0 && st.ctxLen < 20000 {
@@ -200,6 +202,9 @@ func (r *Runner) describeFailure(ctx context.Context, st *state, runs []RunStatu
 		b.WriteString("\n\n")
 		if line := lastErrorLine(excerpt); line != "" {
 			r.logf(Bad, "%s", clip(line, 300))
+			if errorLine == "" {
+				errorLine = line
+			}
 		}
 	}
 	text := strings.TrimSpace(b.String())

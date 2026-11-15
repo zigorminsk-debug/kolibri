@@ -10,6 +10,10 @@
 //
 //	=== DELETE: path/to/old.ext ===
 //
+//	=== NEXT ===
+//	- what is left to do, when the task did not fit into one reply
+//	=== END NEXT ===
+//
 // Local models drift from formats, so the parser is forgiving: a missing END
 // marker, Markdown fences around the content, and a plain Markdown reply
 // ("### main.go" followed by a fenced block) are all understood.
@@ -43,6 +47,9 @@ type Result struct {
 	TruncatedPath string
 	// Rejected lists paths the model sent that cannot be committed.
 	Rejected []string
+	// Next is the model's note on what remains to be done, empty when it
+	// considers the task finished.
+	Next string
 }
 
 // ErrNoFiles means the reply held no file blocks at all.
@@ -51,7 +58,9 @@ var ErrNoFiles = errors.New("в ответе модели нет файлов в
 var (
 	fileMarker   = regexp.MustCompile(`(?i)^\s*={2,}\s*FILE\s*:\s*(.+?)\s*=*\s*$`)
 	deleteMarker = regexp.MustCompile(`(?i)^\s*={2,}\s*DELETE\s*:\s*(.+?)\s*=*\s*$`)
-	endMarker    = regexp.MustCompile(`(?i)^\s*={2,}\s*END(\s+OF)?(\s+FILE)?\s*={2,}\s*$`)
+	endMarker    = regexp.MustCompile(`(?i)^\s*={2,}\s*END(\s+OF)?(\s+(FILE|NEXT))?\s*={2,}\s*$`)
+	nextMarker   = regexp.MustCompile(`(?i)^\s*={2,}\s*NEXT\s*={2,}\s*$`)
+	nothingLeft  = regexp.MustCompile(`(?i)^[\s\-*•.]*(none|nothing|n/a|нет|ничего|—|-)?[\s.]*$`)
 	summaryLine  = regexp.MustCompile(`(?i)^\s*\**SUMMARY\**\s*:\**\s*(.+?)\s*$`)
 	thinkBlock   = regexp.MustCompile(`(?s)<think>.*?</think>`)
 	fenceLine    = regexp.MustCompile("^\\s*(```+|~~~+)\\s*([^`]*)$")
@@ -104,11 +113,32 @@ func parseBlocks(reply string, cutOff bool) Result {
 		res.Files = append(res.Files, File{Path: clean, Content: cleanContent(buf)})
 	}
 
+	inNext := false
+	var next []string
 	for _, line := range lines {
 		if m := fileMarker.FindStringSubmatch(line); m != nil {
 			closeFile()
+			inNext = false
 			open, curPath, buf = true, m[1], nil
 			continue
+		}
+		// Inside a file the word NEXT between equals signs is content only
+		// when the file is still open; models close files before the note.
+		if !open && nextMarker.MatchString(line) {
+			inNext = true
+			continue
+		}
+		if inNext {
+			if endMarker.MatchString(line) {
+				inNext = false
+				continue
+			}
+			if deleteMarker.MatchString(line) {
+				inNext = false
+			} else {
+				next = append(next, line)
+				continue
+			}
 		}
 		if m := deleteMarker.FindStringSubmatch(line); m != nil {
 			closeFile()
@@ -141,7 +171,21 @@ func parseBlocks(reply string, cutOff bool) Result {
 			closeFile()
 		}
 	}
+	res.Next = cleanNext(next)
 	return res
+}
+
+// cleanNext trims the note and drops one that only says "nothing".
+func cleanNext(lines []string) string {
+	text := strings.TrimSpace(strings.Join(lines, "\n"))
+	if nothingLeft.MatchString(text) {
+		return ""
+	}
+	const max = 2000
+	if r := []rune(text); len(r) > max {
+		text = string(r[:max]) + "…"
+	}
+	return text
 }
 
 // pathToken matches something that looks like a relative file path.

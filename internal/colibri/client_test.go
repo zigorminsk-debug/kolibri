@@ -174,3 +174,38 @@ func TestServerDown(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 }
+
+// A server stopped in the middle of a reply must not pass for a finished
+// one: the text so far comes back together with ErrCutShort.
+func TestChatStreamCutShort(t *testing.T) {
+	half := "data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n"
+
+	// The stream simply ends: no finish reason, no [DONE].
+	res, _, err := stream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, half)
+	}, time.Second)
+	if !errors.Is(err, ErrCutShort) || res.Content != "half" {
+		t.Errorf("clean end: res = %+v, err = %v", res, err)
+	}
+
+	// The connection is torn down.
+	res, _, err = stream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, half)
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler)
+	}, time.Second)
+	if !errors.Is(err, ErrCutShort) || res.Content != "half" {
+		t.Errorf("abort: res = %+v, err = %v", res, err)
+	}
+
+	// A finish reason without the closing [DONE] is a complete answer.
+	res, _, err = stream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"whole\"},\"finish_reason\":\"stop\"}]}\n\n")
+	}, time.Second)
+	if err != nil || res.Content != "whole" {
+		t.Errorf("no [DONE]: res = %+v, err = %v", res, err)
+	}
+}
