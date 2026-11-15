@@ -339,3 +339,69 @@ func hint(s string) *widget.Label {
 	l.SizeName = theme.SizeNameCaptionText
 	return l
 }
+
+// flowLayout puts objects in a row and wraps them onto further rows when the
+// row is too narrow, so that a long row of choices does not dictate the
+// minimum width of the window.
+//
+// A Fyne layout learns its width only in Layout, so the height it asks for
+// in MinSize is the one of the last layout. When the number of rows changes,
+// stale is set: the owner must refresh the parent container once more.
+type flowLayout struct {
+	width float32
+	rows  int
+	stale bool
+}
+
+func (l *flowLayout) arrange(objects []fyne.CanvasObject, width float32, place bool) (rows int, height float32) {
+	pad := theme.Padding()
+	var x, y, rowH float32
+	for _, o := range objects {
+		if !o.Visible() {
+			continue
+		}
+		min := o.MinSize()
+		if x > 0 && x+min.Width > width {
+			x, y = 0, y+rowH+pad
+			rowH = 0
+			rows++
+		}
+		if rows == 0 {
+			rows = 1
+		}
+		if place {
+			o.Move(fyne.NewPos(x, y))
+			o.Resize(min)
+		}
+		x += min.Width + pad
+		rowH = fyne.Max(rowH, min.Height)
+	}
+	return rows, y + rowH
+}
+
+func (l *flowLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	rows, _ := l.arrange(objects, size.Width, true)
+	assumed := l.rows
+	if l.width <= 0 {
+		assumed = 1 // what MinSize promised before the first layout
+	}
+	if rows != assumed {
+		l.stale = true
+	}
+	l.rows, l.width = rows, size.Width
+}
+
+func (l *flowLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	var widest float32
+	for _, o := range objects {
+		if o.Visible() {
+			widest = fyne.Max(widest, o.MinSize().Width)
+		}
+	}
+	width := l.width
+	if width <= 0 {
+		width = 1 << 20 // not laid out yet: assume there is room for one row
+	}
+	_, height := l.arrange(objects, width, false)
+	return fyne.NewSize(widest, height)
+}

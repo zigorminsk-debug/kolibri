@@ -23,6 +23,8 @@ func main() {
 
 	w := a.NewWindow(ui.AppName)
 	w.SetIcon(ui.Icon)
+	// Closing the main window closes the help window too and ends the program.
+	w.SetMaster()
 	w.Resize(fyne.NewSize(1240, 800))
 	w.CenterOnScreen()
 

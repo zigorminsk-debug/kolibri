@@ -41,14 +41,16 @@ type Info struct {
 	Contract string
 	// PerOS is false for kinds whose output does not depend on the OS.
 	PerOS bool
+	// Android says that the kind can also be packaged for Android.
+	Android bool
 }
 
 var infos = []Info{
-	{Kind: Auto, Title: "Авто — выберет модель", PerOS: true},
+	{Kind: Auto, Title: "Авто — выберет модель", PerOS: true, Android: true},
 	{Kind: Go, Title: "Go — консольная программа", PerOS: true, Contract: "Stack: Go. Put go.mod in the repository root and `package main` in the root directory. " +
 		"go.mod contains only the `module` and `go 1.22` lines: no `require` block and no go.sum, CI runs `go mod tidy` to resolve imports. " +
 		"Prefer the standard library. CI runs `go test ./...` and `go build ./...`."},
-	{Kind: GoFyne, Title: "Go + Fyne — оконное приложение", PerOS: true, Contract: "Stack: Go with the Fyne v2 GUI toolkit (import path fyne.io/fyne/v2). " +
+	{Kind: GoFyne, Title: "Go + Fyne — оконное приложение", PerOS: true, Android: true, Contract: "Stack: Go with the Fyne v2 GUI toolkit (import path fyne.io/fyne/v2). " +
 		"Put go.mod in the repository root and `package main` in the root directory. " +
 		"go.mod contains only the `module` and `go 1.22` lines: no `require` block and no go.sum, CI runs `go mod tidy` and gets the latest Fyne v2. " +
 		"Update widgets from goroutines only inside fyne.Do(func(){...}). Embed resources with go:embed; no external asset files at runtime."},
@@ -155,7 +157,11 @@ type Options struct {
 	Branch string
 	// AppName names the artifacts; it is sanitised.
 	AppName string
-	// Targets are the operating systems to build for: windows, linux, macos.
+	// Owner is the account the repository belongs to; with AppName it
+	// makes the identifier of the Android package.
+	Owner string
+	// Targets are the systems to build for: windows, linux, macos, android.
+	// A target the kind cannot be built for is left out.
 	Targets []string
 	// Release publishes a GitHub release with the builds after a good run.
 	Release bool
@@ -169,7 +175,12 @@ var runners = map[string]string{
 	"windows": "windows-latest",
 	"linux":   "ubuntu-latest",
 	"macos":   "macos-latest",
+	// The Android SDK and NDK come with the Ubuntu runner image.
+	"android": "ubuntu-latest",
 }
+
+// Android is the target that produces an APK instead of a desktop program.
+const Android = "android"
 
 // RunName is the name of the managed workflow, as GitHub shows it for a run.
 const RunName = "Kolibri Build"
@@ -179,7 +190,56 @@ const RunName = "Kolibri Build"
 const ReleaseJob = "Release"
 
 // TargetNames lists the supported build targets in display order.
-func TargetNames() []string { return []string{"windows", "linux", "macos"} }
+func TargetNames() []string { return []string{"windows", "linux", "macos", Android} }
+
+// Supports reports whether a project of this kind can be built for the
+// target. Kinds whose output is the same everywhere support none.
+func Supports(k Kind, target string) bool {
+	info, ok := Lookup(k)
+	if !ok || !info.PerOS {
+		return false
+	}
+	if _, known := runners[target]; !known {
+		return false
+	}
+	return target != Android || info.Android
+}
+
+// AndroidKinds names the kinds that can be built for Android, for messages.
+func AndroidKinds() string {
+	var titles []string
+	for _, i := range infos {
+		if i.Android && i.Kind != Auto {
+			titles = append(titles, "«"+i.Title+"»")
+		}
+	}
+	return strings.Join(titles, ", ")
+}
+
+// AndroidID builds the identifier of the Android package: reverse-DNS,
+// lower case, every part starting with a letter, no hyphens.
+func AndroidID(owner, app string) string {
+	part := func(s, fallback string) string {
+		var b strings.Builder
+		for _, r := range strings.ToLower(s) {
+			switch {
+			case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+				b.WriteRune(r)
+			default:
+				b.WriteRune('_')
+			}
+		}
+		out := strings.Trim(b.String(), "_")
+		if out == "" {
+			return fallback
+		}
+		if out[0] >= '0' && out[0] <= '9' {
+			out = "a" + out
+		}
+		return out
+	}
+	return "io.github." + part(owner, "kolibri") + "." + part(app, "app")
+}
 
 //go:embed templates/*.yml
 var templateFS embed.FS
@@ -231,15 +291,18 @@ func Render(opts Options) (string, error) {
 		seen := map[string]bool{}
 		for _, t := range opts.Targets {
 			t = strings.ToLower(strings.TrimSpace(t))
-			if runner, ok := runners[t]; ok && !seen[t] {
+			if runner, ok := runners[t]; ok && !seen[t] && Supports(opts.Kind, t) {
 				seen[t] = true
 				matrix = append(matrix, matrixRow{Target: t, Runner: runner})
 			}
 		}
 		if len(matrix) == 0 {
+			if seenTarget(opts.Targets, Android) {
+				return "", fmt.Errorf("под Android собирается только проект типа %s, а здесь — «%s». Отметьте ещё одну систему или выберите другой тип проекта", AndroidKinds(), info.Title)
+			}
 			return "", fmt.Errorf("выберите хотя бы одну систему, для которой собирать приложение")
 		}
-		order := map[string]int{"windows": 0, "linux": 1, "macos": 2}
+		order := map[string]int{"windows": 0, "linux": 1, "macos": 2, Android: 3}
 		sort.Slice(matrix, func(i, j int) bool { return order[matrix[i].Target] < order[matrix[j].Target] })
 	}
 
@@ -264,7 +327,15 @@ func Render(opts Options) (string, error) {
 		Matrix    []matrixRow
 		Artifacts []string
 		Release   bool
-	}{branch, app, matrix, artifacts, opts.Release}
+		// Android is true when an APK is among the builds.
+		Android   bool
+		AndroidID string
+	}{branch, app, matrix, artifacts, opts.Release, false, AndroidID(opts.Owner, app)}
+	for _, row := range matrix {
+		if row.Target == Android {
+			data.Android = true
+		}
+	}
 
 	var buf bytes.Buffer
 	if err := templates.ExecuteTemplate(&buf, string(opts.Kind), data); err != nil {
@@ -272,6 +343,15 @@ func Render(opts Options) (string, error) {
 	}
 	out := strings.TrimRight(buf.String(), "\n") + "\n"
 	return out, nil
+}
+
+func seenTarget(targets []string, want string) bool {
+	for _, t := range targets {
+		if strings.ToLower(strings.TrimSpace(t)) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // SafeName reduces a repository name to characters that are safe in

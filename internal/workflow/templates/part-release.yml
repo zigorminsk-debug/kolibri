@@ -38,9 +38,15 @@
           done
           for d in */; do
             d="${d%/}"
+            apks=("$d"/*.apk)
+            if [ "${#apks[@]}" -gt 0 ]; then
+              # An APK is published as it is: a phone installs it directly.
+              cp "${apks[@]}" . || fail "Could not copy the APK from $d."
+              continue
+            fi
             (cd "$d" && zip -qr "../$d.zip" .) || fail "Could not pack $d."
           done
-          archives=(./*.zip)
+          archives=(./*.zip ./*.apk)
           [ "${#archives[@]}" -gt 0 ] || fail "The build left no files to publish."
           if ! out="$(gh release create "$TAG" "${archives[@]}" --target "$GITHUB_SHA" --title "$TITLE" --notes "${NOTES:-Автоматическая сборка}" 2>&1)"; then
             echo "$out"

@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -787,5 +788,96 @@ func TestReleaseOnlyFailure(t *testing.T) {
 		if _, got := releaseOnlyFailure(c.runs); got != c.want {
 			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+const fyneProgram = "package main\n\nimport \"fyne.io/fyne/v2/app\"\n\nfunc main() { app.New().NewWindow(\"demo\").ShowAndRun() }\n"
+
+// Android is one more system to build for: the model is told to write a
+// Go + Fyne program fit for a phone, and the workflow packs an APK.
+func TestRunBuildsForAndroid(t *testing.T) {
+	gh := newFakeGitHub(t)
+	llm := newFakeLLM(t, func(int, []colibri.Message) fakeReply {
+		return fakeReply{content: goodReply(fyneProgram)}
+	})
+	runner, rec := newRunner(t, llm, gh)
+	task := baseTask(t)
+	task.Owner, task.Repo = "me", "demo"
+	task.Targets = []string{"windows", "android"}
+
+	if _, err := runner.Run(context.Background(), task); err != nil {
+		t.Fatalf("Run: %v\n%s", err, rec.journal())
+	}
+	req := llm.request(0)
+	for _, want := range []string{"must also run on Android", "Stack: Go with the Fyne v2", "The program is built for: Windows, Android.", "GOOS=android", "narrow touch screen"} {
+		if !strings.Contains(req, want) {
+			t.Errorf("request lacks %q:\n%s", want, req)
+		}
+	}
+	// With Android asked for there is nothing to choose from.
+	if strings.Contains(req, "Choose the stack") || strings.Contains(req, "Stack: Rust") {
+		t.Errorf("request still offers other stacks:\n%s", req)
+	}
+	wf := gh.headFiles("main")[workflow.Path]
+	for _, want := range []string{"- { target: windows, os: windows-latest }", "- { target: android, os: ubuntu-latest }", "APP_ID: io.github.me.demo\n", "name: Download demo-android\n"} {
+		if !strings.Contains(wf, want) {
+			t.Errorf("workflow lacks %q:\n%s", want, wf)
+		}
+	}
+	if strings.Contains(rec.journal(), "Под Android") {
+		t.Errorf("a warning about Android although the stack supports it:\n%s", rec.journal())
+	}
+}
+
+// A stack that cannot give an APK is still built for the other systems,
+// and the user is told once why there is no Android build.
+func TestRunWarnsWhenStackHasNoAndroid(t *testing.T) {
+	gh := newFakeGitHub(t)
+	gh.seed(map[string]string{
+		"go.mod":  "module demo\n\ngo 1.22\n",
+		"main.go": "package main\n\nfunc main() { println(\"v1\") }\n",
+	})
+	llm := newFakeLLM(t, func(n int, _ []colibri.Message) fakeReply {
+		return fakeReply{content: fmt.Sprintf("=== FILE: main.go ===\npackage main\n\nfunc main() { println(\"v%d\") }\n=== END FILE ===\n", n+2)}
+	})
+	runner, rec := newRunner(t, llm, gh)
+	task := baseTask(t)
+	task.Targets = []string{"linux", "android"}
+
+	if _, err := runner.Run(context.Background(), task); err != nil {
+		t.Fatalf("Run: %v\n%s", err, rec.journal())
+	}
+	req := llm.request(0)
+	if strings.Contains(req, "Android") || !strings.Contains(req, "The program is built for: Linux.") {
+		t.Errorf("a console Go project must not be told about Android:\n%s", req)
+	}
+	if wf := gh.headFiles("main")[workflow.Path]; strings.Contains(strings.ToLower(wf), "android") || !strings.Contains(wf, "target: linux") {
+		t.Errorf("workflow:\n%s", wf)
+	}
+	if n := strings.Count(rec.journal(), "Под Android сборки не будет"); n != 1 {
+		t.Errorf("the Android warning appeared %d times, want once:\n%s", n, rec.journal())
+	}
+
+	// Android alone leaves nothing to build: the run stops with the reason.
+	task.Targets = []string{"android"}
+	_, err := runner.Run(context.Background(), task)
+	if err == nil || !strings.Contains(err.Error(), "Android") {
+		t.Errorf("err = %v, want an explanation about Android", err)
+	}
+}
+
+func TestBuildRulesForAndroid(t *testing.T) {
+	both := []string{"windows", "android"}
+	if got := buildRules(workflow.GoFyne, both); !strings.Contains(got, "built for: Windows, Android.") || !strings.Contains(got, androidRules) {
+		t.Errorf("go-fyne:\n%s", got)
+	}
+	if got := buildRules(workflow.Rust, both); strings.Contains(got, "Android") || !strings.Contains(got, "built for: Windows.") {
+		t.Errorf("rust:\n%s", got)
+	}
+	if got := buildRules(workflow.Static, both); strings.Contains(got, "Android") || strings.Contains(got, "built for") {
+		t.Errorf("static:\n%s", got)
+	}
+	if got := buildRules(workflow.Auto, []string{"windows"}); strings.Contains(got, "Android") || !strings.Contains(got, "Choose the stack") {
+		t.Errorf("auto without android:\n%s", got)
 	}
 }

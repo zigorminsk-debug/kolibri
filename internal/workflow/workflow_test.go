@@ -16,7 +16,7 @@ func TestRenderAllKinds(t *testing.T) {
 			continue
 		}
 		for _, release := range []bool{true, false} {
-			out, err := Render(Options{Kind: info.Kind, Branch: "main", AppName: "my app!", Targets: []string{"linux", "windows", "macos", "linux", "beos"}, Release: release})
+			out, err := Render(Options{Kind: info.Kind, Branch: "main", AppName: "my app!", Owner: "Some-Owner", Targets: []string{"android", "linux", "windows", "macos", "linux", "beos"}, Release: release})
 			if err != nil {
 				t.Fatalf("%s: %v", info.Kind, err)
 			}
@@ -44,6 +44,13 @@ func TestRenderAllKinds(t *testing.T) {
 					t.Errorf("%s: matrix wrong:\n%s", info.Kind, out)
 				}
 			}
+			// Only a stack that can be packed into an APK gets the Android build.
+			if got := strings.Contains(out, "target: android"); got != info.Android {
+				t.Errorf("%s: android build present = %v, want %v", info.Kind, got, info.Android)
+			}
+			if got := strings.Contains(out, "bin/fyne\" package"); got != info.Android {
+				t.Errorf("%s: android packaging present = %v, want %v", info.Kind, got, info.Android)
+			}
 			if *dump != "" {
 				name := string(info.Kind)
 				if release {
@@ -70,6 +77,9 @@ func TestReleaseDownloadsEachArtifactByName(t *testing.T) {
 	}{
 		{Go, []string{"windows"}, []string{"app-windows"}},
 		{GoFyne, []string{"linux", "windows", "macos"}, []string{"app-windows", "app-linux", "app-macos"}},
+		{GoFyne, []string{"android"}, []string{"app-android"}},
+		{GoFyne, []string{"android", "windows"}, []string{"app-windows", "app-android"}},
+		{Rust, []string{"android", "linux"}, []string{"app-linux"}},
 		{Static, nil, []string{"app-web"}},
 		{Node, []string{"linux"}, []string{"app-web"}},
 		{Generic, nil, []string{"app-source"}},
@@ -92,7 +102,7 @@ func TestReleaseDownloadsEachArtifactByName(t *testing.T) {
 				t.Errorf("%s: release does not download %s into its own folder:\n%s", c.kind, name, release)
 			}
 			// What is downloaded must be what the build uploads.
-			if c.kind == Go || c.kind == GoFyne {
+			if info, _ := Lookup(c.kind); info.PerOS {
 				continue // uploaded as <app>-${{ matrix.target }}
 			}
 			if !strings.Contains(out, "uses: actions/upload-artifact@v7\n        with:\n          name: "+name+"\n") {
@@ -173,5 +183,76 @@ func TestContracts(t *testing.T) {
 	}
 	if auto := AutoContract(); !strings.Contains(auto, "Fyne") || !strings.Contains(auto, "main.py") {
 		t.Errorf("auto contract misses stacks:\n%s", auto)
+	}
+}
+
+func TestAndroidTarget(t *testing.T) {
+	out, err := Render(Options{Kind: GoFyne, Branch: "main", Owner: "zigorminsk-debug", AppName: "My App", Targets: []string{"android"}, Release: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"- { target: android, os: ubuntu-latest }",
+		"APP_ID: io.github.zigorminsk_debug.my_app\n",
+		"APP_NAME: " + SafeName("My App") + "\n",
+		"if: matrix.target == 'android'",
+		"if: matrix.target != 'android'",
+		"mv ./*.apk dist/",
+		"archives=(./*.zip ./*.apk)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no %q in the workflow:\n%s", want, out)
+		}
+	}
+
+	// Without Android the workflow stays as it was: no packaging step at all.
+	out, err = Render(Options{Kind: GoFyne, Branch: "main", AppName: "app", Targets: []string{"windows", "linux"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(out), "android") {
+		t.Errorf("android steps in a desktop-only workflow:\n%s", out)
+	}
+
+	// Android alone for a stack that cannot give an APK is an error that says so.
+	_, err = Render(Options{Kind: Rust, Branch: "main", AppName: "app", Targets: []string{"android"}})
+	if err == nil || !strings.Contains(err.Error(), "Android") || !strings.Contains(err.Error(), "Go + Fyne") {
+		t.Errorf("err = %v, want an explanation about Android", err)
+	}
+}
+
+func TestAndroidID(t *testing.T) {
+	for _, c := range []struct{ owner, app, want string }{
+		{"zigorminsk-debug", "cslvpn", "io.github.zigorminsk_debug.cslvpn"},
+		{"Acme", "2048 Game!", "io.github.acme.a2048_game"},
+		{"_x_", "---", "io.github.x.app"},
+		{"", "Калькулятор", "io.github.kolibri.app"},
+		{"a.b", "my.app", "io.github.a_b.my_app"},
+	} {
+		got := AndroidID(c.owner, c.app)
+		if got != c.want {
+			t.Errorf("AndroidID(%q, %q) = %q, want %q", c.owner, c.app, got, c.want)
+		}
+		// What `fyne package` accepts: no hyphen, parts start with a letter.
+		for _, part := range strings.Split(got, ".") {
+			if part == "" || strings.Contains(part, "-") || part[0] == '_' || (part[0] >= '0' && part[0] <= '9') {
+				t.Errorf("AndroidID(%q, %q) = %q: part %q is not valid", c.owner, c.app, got, part)
+			}
+		}
+	}
+}
+
+func TestSupports(t *testing.T) {
+	for _, c := range []struct {
+		kind   Kind
+		target string
+		want   bool
+	}{
+		{GoFyne, "android", true}, {Auto, "android", true}, {Go, "android", false}, {Python, "android", false},
+		{Go, "linux", true}, {Static, "linux", false}, {Static, "android", false}, {GoFyne, "beos", false},
+	} {
+		if got := Supports(c.kind, c.target); got != c.want {
+			t.Errorf("Supports(%s, %s) = %v, want %v", c.kind, c.target, got, c.want)
+		}
 	}
 }

@@ -32,6 +32,14 @@ type Config struct {
 	// Where finished builds are unpacked.
 	OutputDir string `json:"output_dir"`
 
+	// Updates of the program itself. CheckUpdates asks GitHub for releases
+	// at start; UpdateBuilds also offers the build-N pre-releases published
+	// between versions; UpdateSkipped is the tag the user chose not to be
+	// reminded of.
+	CheckUpdates  bool   `json:"check_updates"`
+	UpdateBuilds  bool   `json:"update_builds"`
+	UpdateSkipped string `json:"update_skipped,omitempty"`
+
 	// Last task form.
 	Repo        string   `json:"repo,omitempty"` // owner/name
 	Branch      string   `json:"branch,omitempty"`
@@ -51,6 +59,8 @@ func Default() Config {
 		IdleTimeoutMin: 15,
 		OutputDir:      defaultOutputDir(),
 		ProjectKind:    "auto",
+		CheckUpdates:   true,
+		UpdateBuilds:   true,
 		Targets:        []string{"windows", "linux"},
 		MaxFixes:       3,
 		Private:        true,

@@ -29,6 +29,7 @@ import (
 	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
 	"github.com/zigorminsk-debug/kolibri/internal/pipeline"
 	"github.com/zigorminsk-debug/kolibri/internal/runlog"
+	"github.com/zigorminsk-debug/kolibri/internal/update"
 	"github.com/zigorminsk-debug/kolibri/internal/workflow"
 )
 
@@ -43,9 +44,23 @@ type UI struct {
 	// Save persists settings; replaced in tests.
 	Save func(config.Config) error
 
-	// Test hooks: stand-ins for api.github.com and github.com.
+	// Test hooks: stand-ins for api.github.com and github.com, for the
+	// version stamped into the binary and for the operating system.
 	ghBaseURL    string
 	oauthBaseURL string
+	version      *update.Current
+	goosOverride string
+
+	// update strip under the header, and what it offers
+	top          *fyne.Container
+	root         *fyne.Container
+	updateBar    *fyne.Container
+	updateFound  *update.Found
+	updateDialog *dialog.CustomDialog
+
+	// help window, while it is open
+	helpWin  fyne.Window
+	helpView *helpView
 
 	// header
 	llmChip *chip
@@ -62,14 +77,19 @@ type UI struct {
 	kind      *widget.Select
 	targets   map[string]*widget.Check
 	targetRow *fyne.Container
-	prompt    *widget.Entry
-	fixes     *widget.Select
-	private   *widget.Check
-	release   *widget.Check
-	problem   *widget.Label
-	formFoot  *fyne.Container
-	formBody  *fyne.Container
-	runBtn    *widget.Button
+	// targetFlow wraps the systems onto a second row in a narrow window.
+	targetFlow *flowLayout
+	// targetHint explains what the Android choice gives and requires.
+	targetHint *widget.Label
+	formTop    *fyne.Container
+	prompt     *widget.Entry
+	fixes      *widget.Select
+	private    *widget.Check
+	release    *widget.Check
+	problem    *widget.Label
+	formFoot   *fyne.Container
+	formBody   *fyne.Container
+	runBtn     *widget.Button
 
 	// progress
 	stages  *stageBar
@@ -149,6 +169,7 @@ func (u *UI) spawn(fn func()) {
 // Start runs the connection checks and the redraw ticker.
 func (u *UI) Start() {
 	u.CheckConnections()
+	u.checkUpdatesAtStart()
 	u.stopTick = make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(streamInterval)
@@ -175,12 +196,20 @@ func (u *UI) Stop() {
 		close(u.stopTick)
 		u.stopTick = nil
 	}
+	if u.helpWin != nil {
+		u.helpWin.Close()
+	}
 	u.saveForm()
 }
 
 // tick redraws what changes with time: the streamed text and the clock.
 func (u *UI) tick() {
 	u.stream.flush()
+	if u.targetFlow != nil && u.targetFlow.stale {
+		// The row of systems wrapped (or unwrapped): give it its new height.
+		u.targetFlow.stale = false
+		u.relayoutTop()
+	}
 	if u.running {
 		u.timer.Text = clock(time.Since(u.started))
 		u.timer.Refresh()
@@ -193,8 +222,9 @@ func (u *UI) layout() fyne.CanvasObject {
 	bg := canvas.NewRectangle(colInk)
 	body := container.NewHSplit(u.formPanel(), u.progressPanel())
 	body.Offset = 0.33
-	content := container.NewBorder(u.header(), nil, nil, nil, body)
-	return container.NewStack(bg, container.New(layout.NewCustomPaddedLayout(10, 12, 14, 14), content))
+	u.top = container.NewVBox(u.header(), u.updateBarHolder())
+	u.root = container.NewBorder(u.top, nil, nil, nil, body)
+	return container.NewStack(bg, container.New(layout.NewCustomPaddedLayout(10, 12, 14, 14), u.root))
 }
 
 func (u *UI) header() fyne.CanvasObject {
@@ -216,9 +246,10 @@ func (u *UI) header() fyne.CanvasObject {
 		u.CheckConnections()
 	})
 	settings := widget.NewButtonWithIcon("Настройки", theme.SettingsIcon(), u.showSettings)
+	help := widget.NewButtonWithIcon("", theme.HelpIcon(), func() { u.showHelp("") })
 
 	left := container.NewHBox(fixed(34, 34, logo), gap(4, 0), container.NewCenter(title))
-	right := container.NewHBox(container.NewCenter(u.llmChip), gap(2, 0), container.NewCenter(u.ghChip), gap(6, 0), container.NewCenter(settings))
+	right := container.NewHBox(container.NewCenter(u.llmChip), gap(2, 0), container.NewCenter(u.ghChip), gap(6, 0), container.NewCenter(settings), container.NewCenter(help))
 	bar := container.NewBorder(nil, nil, left, right, container.NewVBox(layout.NewSpacer(), sub, layout.NewSpacer()))
 	u.llmChip.onResize = bar.Refresh
 	u.ghChip.onResize = bar.Refresh
@@ -241,12 +272,15 @@ func (u *UI) formPanel() fyne.CanvasObject {
 	u.kind = widget.NewSelect(titles, func(string) { u.syncTargets() })
 
 	u.targets = map[string]*widget.Check{}
-	u.targetRow = container.NewHBox()
+	u.targetFlow = &flowLayout{}
+	u.targetRow = container.New(u.targetFlow)
 	for _, t := range workflow.TargetNames() {
-		c := widget.NewCheck(targetTitle(t), func(bool) { u.clearProblem() })
+		c := widget.NewCheck(targetTitle(t), func(bool) { u.syncTargetHint(); u.clearProblem() })
 		u.targets[t] = c
 		u.targetRow.Add(c)
 	}
+	u.targetHint = hint("")
+	u.targetHint.Hide()
 
 	u.prompt = widget.NewMultiLineEntry()
 	u.prompt.Wrapping = fyne.TextWrapWord
@@ -269,7 +303,7 @@ func (u *UI) formPanel() fyne.CanvasObject {
 		container.NewVBox(fieldLabel("Ветка"), fixed(118, u.branch.MinSize().Height, u.branch)),
 		container.NewVBox(fieldLabel("Репозиторий на GitHub"), u.repo))
 
-	top := container.NewVBox(
+	u.formTop = container.NewVBox(
 		text("Новая задача", 17, colText, fyne.TextStyle{Bold: true}),
 		gap(0, 2),
 		repoRow,
@@ -277,6 +311,7 @@ func (u *UI) formPanel() fyne.CanvasObject {
 		u.kind,
 		fieldLabel("Собрать для"),
 		u.targetRow,
+		u.targetHint,
 		fieldLabel("Что нужно сделать"),
 	)
 	u.formFoot = container.NewVBox(
@@ -288,7 +323,7 @@ func (u *UI) formPanel() fyne.CanvasObject {
 		gap(0, 2),
 		u.runBtn,
 	)
-	u.formBody = container.NewBorder(top, u.formFoot, nil, nil, u.prompt)
+	u.formBody = container.NewBorder(u.formTop, u.formFoot, nil, nil, u.prompt)
 	return panel(u.formBody)
 }
 
@@ -329,6 +364,8 @@ func targetTitle(t string) string {
 		return "Linux"
 	case "macos":
 		return "macOS"
+	case workflow.Android:
+		return "Android"
 	}
 	return t
 }
@@ -370,7 +407,7 @@ func (u *UI) formToConfig() {
 	u.cfg.Repo = strings.TrimSpace(u.repo.Text)
 	u.cfg.Branch = strings.TrimSpace(u.branch.Text)
 	u.cfg.ProjectKind = string(u.selectedKind().Kind)
-	u.cfg.Targets = u.selectedTargets()
+	u.cfg.Targets = u.checkedTargets()
 	u.cfg.LastTask = u.prompt.Text
 	u.cfg.MaxFixes = max(u.fixes.SelectedIndex(), 0)
 	u.cfg.Private = u.private.Checked
@@ -392,7 +429,9 @@ func (u *UI) selectedKind() workflow.Info {
 	return u.kindInfos[i]
 }
 
-func (u *UI) selectedTargets() []string {
+// checkedTargets lists every ticked system, whatever the stack: this is what
+// the form remembers.
+func (u *UI) checkedTargets() []string {
 	var out []string
 	for _, t := range workflow.TargetNames() {
 		if u.targets[t].Checked {
@@ -402,18 +441,71 @@ func (u *UI) selectedTargets() []string {
 	return out
 }
 
-// syncTargets greys out the OS choice for stacks whose output is the same
-// everywhere (a web build), so the form never offers a meaningless option.
+// selectedTargets lists the ticked systems the chosen stack can be built for.
+func (u *UI) selectedTargets() []string {
+	kind := u.selectedKind().Kind
+	var out []string
+	for _, t := range workflow.TargetNames() {
+		if u.targets[t].Checked && workflow.Supports(kind, t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// syncTargets greys out the choices that mean nothing for the stack: all of
+// them for a web build, Android for a stack that cannot be packed into an APK.
 func (u *UI) syncTargets() {
-	perOS := u.selectedKind().PerOS
-	for _, c := range u.targets {
-		if perOS && !u.running {
+	kind := u.selectedKind().Kind
+	for t, c := range u.targets {
+		if workflow.Supports(kind, t) && !u.running {
 			c.Enable()
 		} else {
 			c.Disable()
 		}
 	}
+	u.syncTargetHint()
 	u.clearProblem()
+}
+
+// syncTargetHint shows, under the systems, what choosing Android leads to.
+func (u *UI) syncTargetHint() {
+	if u.targetHint == nil {
+		return
+	}
+	msg := ""
+	if c := u.targets[workflow.Android]; c != nil && c.Checked {
+		info := u.selectedKind()
+		switch {
+		case !info.PerOS:
+		case !info.Android:
+			msg = "Android недоступен для этого типа проекта: APK собирается только из " + workflow.AndroidKinds() + "."
+		case info.Kind == workflow.Auto:
+			msg = "Для Android модель напишет программу на Go + Fyne. Получится APK с отладочной подписью — для установки на свой телефон, не для Google Play."
+		default:
+			msg = "Получится APK с отладочной подписью — для установки на свой телефон, не для Google Play."
+		}
+	}
+	if msg == u.targetHint.Text && (msg != "") == u.targetHint.Visible() {
+		return
+	}
+	u.targetHint.SetText(msg)
+	if msg == "" {
+		u.targetHint.Hide()
+	} else {
+		u.targetHint.Show()
+	}
+	u.relayoutTop()
+}
+
+// relayoutTop gives the upper part of the form its new height, at the
+// expense of the task text.
+func (u *UI) relayoutTop() {
+	if u.formTop == nil || u.formBody == nil {
+		return
+	}
+	u.formTop.Refresh()
+	u.formBody.Refresh()
 }
 
 func (u *UI) showProblem(msg string) {
@@ -493,6 +585,9 @@ func (u *UI) taskFromForm() (pipeline.Task, error) {
 	kind := u.selectedKind()
 	targets := u.selectedTargets()
 	if kind.PerOS && len(targets) == 0 {
+		if u.targets[workflow.Android].Checked && !kind.Android {
+			return pipeline.Task{}, errors.New("под Android собирается только " + workflow.AndroidKinds() + ": отметьте другую систему или смените тип проекта")
+		}
 		return pipeline.Task{}, errors.New("отметьте хотя бы одну систему, для которой собирать программу")
 	}
 	return pipeline.Task{

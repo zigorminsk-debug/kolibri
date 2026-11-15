@@ -206,6 +206,8 @@ type state struct {
 	pending bool
 	// next is the model's latest note on what remains.
 	next string
+	// androidWarned: the user was told once that this stack gives no APK.
+	androidWarned bool
 	// lastError is the most telling line of the latest build failure.
 	lastError string
 }
@@ -810,10 +812,18 @@ func (r *Runner) generate(ctx context.Context, st *state, failure, resume string
 		}
 	}
 	wf, err := workflow.Render(workflow.Options{
-		Kind: st.kind, Branch: st.branch, AppName: task.Repo, Targets: task.Targets, Release: task.Release,
+		Kind: st.kind, Branch: st.branch, Owner: task.Owner, AppName: task.Repo, Targets: task.Targets, Release: task.Release,
 	})
 	if err != nil {
 		return none, err
+	}
+	if wantsAndroid(task.Targets) && !workflow.Supports(st.kind, workflow.Android) && !st.androidWarned {
+		st.androidWarned = true
+		title := string(st.kind)
+		if info, ok := workflow.Lookup(st.kind); ok {
+			title = info.Title
+		}
+		r.logf(Warn, "Под Android сборки не будет: проект типа «%s», а APK получается только из %s", title, workflow.AndroidKinds())
 	}
 	if st.project[workflow.Path] != wf {
 		status := "new"

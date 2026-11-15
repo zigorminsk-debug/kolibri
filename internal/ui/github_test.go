@@ -22,6 +22,10 @@ type fakeHub struct {
 	scopes string // X-OAuth-Scopes for the token "good"
 	repos  []map[string]any
 	polls  []string // answers of the device-flow token endpoint, in order
+	// Releases of the program itself, for the update check.
+	releases       []map[string]any
+	releasesStatus int      // answer with this status instead of the list
+	releaseAuth    []string // Authorization headers the update check sent
 }
 
 func newFakeHub(t *testing.T) *fakeHub {
@@ -65,6 +69,18 @@ func newFakeHub(t *testing.T) *fakeHub {
 				return
 			}
 			json.NewEncoder(w).Encode(h.repos)
+		case "/repos/zigorminsk-debug/kolibri/releases":
+			h.releaseAuth = append(h.releaseAuth, r.Header.Get("Authorization"))
+			if h.releasesStatus != 0 {
+				w.WriteHeader(h.releasesStatus)
+				w.Write([]byte(`{"message":"Not Found"}`))
+				return
+			}
+			if h.releases == nil {
+				w.Write([]byte(`[]`))
+				return
+			}
+			json.NewEncoder(w).Encode(h.releases)
 		case "/login/device/code":
 			w.Write([]byte(`{"device_code":"dev-1","user_code":"WDJB-MJHT","verification_uri":"https://github.com/login/device","expires_in":900,"interval":5}`))
 		case "/login/oauth/access_token":

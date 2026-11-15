@@ -7,6 +7,7 @@ import (
 	"image/png"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -239,8 +240,13 @@ func TestScreens(t *testing.T) {
 	// The window must fit a 1024×768 screen even with the longest labels.
 	u.llmChip.Set("Колибри · "+shorten("a-very-long-model-identifier-q8-k-m", 20)+" · 128k", toneGood)
 	u.ghChip.Set("GitHub · "+shorten("a-very-long-github-login", 16)+" · нет workflow", toneBusy)
-	if min := win.Content().MinSize(); min.Width > 1000 || min.Height > 640 {
-		t.Errorf("minimum window size is %v, want at most 1000×640", min)
+	// (In a window this narrow the systems take two rows.)
+	if min := win.Content().MinSize(); min.Width > 1000 || min.Height > 680 {
+		t.Errorf("minimum window size is %v, want at most 1000×680", min)
+	}
+	t.Logf("minimum window size: %v", win.Content().MinSize())
+	if u.targetFlow.rows != 2 {
+		t.Errorf("systems are in %d rows in the small window, want 2", u.targetFlow.rows)
 	}
 }
 
@@ -281,6 +287,91 @@ func TestFormValidation(t *testing.T) {
 	u.onRunTapped()
 	if u.running || !strings.Contains(u.problem.Text, "токен") {
 		t.Errorf("no token: running=%v problem=%q", u.running, u.problem.Text)
+	}
+}
+
+// Android is offered only where an APK can be built, and the form says what
+// the choice leads to.
+func TestAndroidTarget(t *testing.T) {
+	u, win := newTestUI(t, demoConfig(), 1240, 800)
+	u.repo.SetText("me/app")
+	u.prompt.SetText("сделай")
+	u.targets["macos"].SetChecked(false)
+	// At the usual width the four systems fit one row, and stay there.
+	u.tick()
+	if u.targetFlow.rows != 1 || u.targetFlow.stale {
+		t.Errorf("systems: %d rows, stale=%v; want one settled row", u.targetFlow.rows, u.targetFlow.stale)
+	}
+	android := u.targets["android"]
+	if android == nil {
+		t.Fatal("no Android checkbox")
+	}
+	if android.Text != "Android" || android.Checked {
+		t.Errorf("android checkbox: text=%q checked=%v", android.Text, android.Checked)
+	}
+	pick := func(kind string) {
+		t.Helper()
+		for i, k := range u.kindInfos {
+			if string(k.Kind) == kind {
+				u.kind.SetSelectedIndex(i)
+				return
+			}
+		}
+		t.Fatalf("no kind %q", kind)
+	}
+
+	// Auto: allowed, and the hint says which stack the model will use.
+	pick("auto")
+	if android.Disabled() || u.targetHint.Visible() {
+		t.Errorf("auto, not ticked: disabled=%v hint=%v", android.Disabled(), u.targetHint.Visible())
+	}
+	android.SetChecked(true)
+	if !u.targetHint.Visible() || !strings.Contains(u.targetHint.Text, "Go + Fyne") || !strings.Contains(u.targetHint.Text, "APK") {
+		t.Errorf("auto: hint=%q visible=%v", u.targetHint.Text, u.targetHint.Visible())
+	}
+	task, err := u.taskFromForm()
+	if err != nil || !reflect.DeepEqual(task.Targets, []string{"windows", "linux", "android"}) {
+		t.Errorf("auto: targets=%v err=%v", task.Targets, err)
+	}
+
+	snap(t, win, "40-android-auto")
+
+	pick("go-fyne")
+	if android.Disabled() || !u.targetHint.Visible() || strings.Contains(u.targetHint.Text, "модель напишет") {
+		t.Errorf("go-fyne: disabled=%v hint=%q", android.Disabled(), u.targetHint.Text)
+	}
+	snap(t, win, "41-android-fyne")
+
+	// A stack with no APK: the box is greyed out and the target is left out.
+	pick("rust")
+	if !android.Disabled() || u.targets["linux"].Disabled() || !strings.Contains(u.targetHint.Text, "недоступен") {
+		t.Errorf("rust: android disabled=%v hint=%q", android.Disabled(), u.targetHint.Text)
+	}
+	snap(t, win, "42-android-unavailable")
+	task, err = u.taskFromForm()
+	if err != nil || !reflect.DeepEqual(task.Targets, []string{"windows", "linux"}) {
+		t.Errorf("rust: targets=%v err=%v", task.Targets, err)
+	}
+	u.targets["windows"].SetChecked(false)
+	u.targets["linux"].SetChecked(false)
+	if _, err := u.taskFromForm(); err == nil || !strings.Contains(err.Error(), "Android") {
+		t.Errorf("rust, android only: err = %v", err)
+	}
+
+	// The tick is remembered whatever the stack, and comes back with it.
+	var saved config.Config
+	u.Save = func(c config.Config) error { saved = c; return nil }
+	u.Stop()
+	if !reflect.DeepEqual(saved.Targets, []string{"android"}) {
+		t.Errorf("saved targets = %v", saved.Targets)
+	}
+	pick("go-fyne")
+	if android.Disabled() {
+		t.Error("Android must come back for Go + Fyne")
+	}
+	android.SetChecked(false)
+	if u.targetHint.Visible() {
+		t.Error("the hint must go away with the tick")
 	}
 }
 

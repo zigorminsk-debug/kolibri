@@ -150,8 +150,33 @@ func (c *Client) DownloadArtifact(ctx context.Context, owner, repo string, id in
 
 // Release is a published GitHub release.
 type Release struct {
-	TagName string `json:"tag_name"`
-	HTMLURL string `json:"html_url"`
+	TagName     string         `json:"tag_name"`
+	Name        string         `json:"name"`
+	HTMLURL     string         `json:"html_url"`
+	Body        string         `json:"body"`
+	Draft       bool           `json:"draft"`
+	Prerelease  bool           `json:"prerelease"`
+	PublishedAt time.Time      `json:"published_at"`
+	Assets      []ReleaseAsset `json:"assets"`
+}
+
+// ReleaseAsset is a file attached to a release.
+type ReleaseAsset struct {
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+	URL  string `json:"browser_download_url"`
+}
+
+// Releases lists the latest releases of a repository, newest first. A
+// repository without releases gives an empty list; a public repository
+// needs no token.
+func (c *Client) Releases(ctx context.Context, owner, repo string, limit int) ([]Release, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 30
+	}
+	var out []Release
+	_, err := c.do(ctx, http.MethodGet, fmt.Sprintf("%s/releases?per_page=%d", repoPath(owner, repo), limit), nil, &out)
+	return out, err
 }
 
 // ReleaseByTag fetches a release; IsNotFound(err) when there is none.

@@ -39,12 +39,28 @@ Large tasks: you have no memory between requests. When a work log is shown, it i
 
 Leave the NEXT block out when the task is finished.`
 
-var targetTitles = map[string]string{"windows": "Windows", "linux": "Linux", "macos": "macOS"}
+var targetTitles = map[string]string{"windows": "Windows", "linux": "Linux", "macos": "macOS", workflow.Android: "Android"}
+
+// androidRules is added when the program is also packaged for a phone.
+const androidRules = "Android: CI packs the same Go + Fyne code into an APK with `fyne package`, so the code must compile with GOOS=android. " +
+	"Use only pure-Go dependencies besides Fyne. Do not start other programs (os/exec), do not use the system tray, extra windows, drag and drop of files or desktop-only packages; " +
+	"code that exists only for desktops goes into files with `//go:build !android`. " +
+	"Keep data in fyne.CurrentApp().Storage() and Preferences() and open files through the Fyne dialogs — a phone has no home directory to write to. " +
+	"Lay the window out for a narrow touch screen: one column, long content inside container.NewVScroll, every action reachable by a tap (no hover, right click or keyboard shortcut only). " +
+	"Do not rely on Window.Resize or SetFixedSize — on a phone the window always fills the screen. " +
+	"Do not add AndroidManifest.xml, Gradle files or an icon: CI supplies the package identifier, the signature and the icon."
 
 func buildRules(kind workflow.Kind, targets []string) string {
 	var b strings.Builder
 	b.WriteString("Build rules:\n")
-	if kind == workflow.Auto {
+	android := wantsAndroid(targets) && workflow.Supports(kind, workflow.Android)
+	if kind == workflow.Auto && android {
+		// Only one stack can be packaged for a phone, so there is no choice.
+		if info, ok := workflow.Lookup(workflow.GoFyne); ok {
+			b.WriteString("The program must also run on Android, and CI can build an Android package only from this stack, so use it:\n")
+			b.WriteString(info.Contract)
+		}
+	} else if kind == workflow.Auto {
 		b.WriteString(workflow.AutoContract())
 	} else if info, ok := workflow.Lookup(kind); ok {
 		b.WriteString(info.Contract)
@@ -52,7 +68,7 @@ func buildRules(kind workflow.Kind, targets []string) string {
 	if info, ok := workflow.Lookup(kind); ok && info.PerOS && len(targets) > 0 {
 		names := make([]string, 0, len(targets))
 		for _, t := range targets {
-			if title, ok := targetTitles[t]; ok {
+			if title, ok := targetTitles[t]; ok && workflow.Supports(kind, t) {
 				names = append(names, title)
 			}
 		}
@@ -60,7 +76,19 @@ func buildRules(kind workflow.Kind, targets []string) string {
 			b.WriteString("\nThe program is built for: " + strings.Join(names, ", ") + ".")
 		}
 	}
+	if android {
+		b.WriteString("\n" + androidRules)
+	}
 	return b.String()
+}
+
+func wantsAndroid(targets []string) bool {
+	for _, t := range targets {
+		if t == workflow.Android {
+			return true
+		}
+	}
+	return false
 }
 
 // lockFile reports generated dependency locks: the model should know they

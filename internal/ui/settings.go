@@ -186,6 +186,16 @@ func (u *UI) showSettings() {
 		}, u.win)
 	})
 
+	autoUpdate := widget.NewCheck("Проверять обновления при запуске", nil)
+	autoUpdate.SetChecked(cfg.CheckUpdates)
+	updateBuilds := widget.NewCheck("Предлагать промежуточные сборки", nil)
+	updateBuilds.SetChecked(cfg.UpdateBuilds)
+	updateStatus := newStatus()
+	var checkUpdate *widget.Button
+	checkUpdate = widget.NewButtonWithIcon("Проверить обновления", theme.ViewRefreshIcon(), func() {
+		u.checkUpdatesInto(checkUpdate, updateStatus)
+	})
+
 	problem := newStatus()
 	row := func(label string, control fyne.CanvasObject) fyne.CanvasObject {
 		return container.NewVBox(fieldLabel(label), control)
@@ -217,11 +227,18 @@ func (u *UI) showSettings() {
 
 		sectionTitle("Готовые сборки"),
 		row("Папка, куда скачивать программы", container.NewBorder(nil, nil, nil, pick, outDir)),
+
+		sectionTitle("Обновления"),
+		autoUpdate,
+		updateBuilds,
+		hint("Программа спрашивает у GitHub список релизов и сравнивает со своей версией; токен при этом не используется. Сама она ничего не скачивает и не устанавливает. Промежуточные сборки выходят между версиями: они свежее, но проверены меньше."),
+		container.NewHBox(checkUpdate),
+		updateStatus.label,
 		problem.label,
 		gap(0, 4),
 	)
 
-	for _, st := range []*status{llmStatus, ghStatus, problem} {
+	for _, st := range []*status{llmStatus, ghStatus, updateStatus, problem} {
 		st.after = form.Refresh
 	}
 
@@ -258,6 +275,7 @@ func (u *UI) showSettings() {
 		next.IdleTimeoutMin = m
 		next.GitHubToken = strings.TrimSpace(token.Text)
 		next.GitHubClientID = strings.TrimSpace(clientID.Text)
+		next.CheckUpdates, next.UpdateBuilds = autoUpdate.Checked, updateBuilds.Checked
 		if dir := strings.TrimSpace(outDir.Text); dir != "" {
 			next.OutputDir = dir
 		}
@@ -290,14 +308,14 @@ func (u *UI) showSettings() {
 // versionLine names the build the user is running; the numbers are stamped
 // into the binary by the packaging step on GitHub Actions.
 func (u *UI) versionLine() string {
-	meta := u.app.Metadata()
+	cur := u.current()
 	switch {
-	case meta.Version == "":
+	case !cur.Known():
 		return AppName + " · сборка из исходников"
-	case meta.Build > 0:
-		return fmt.Sprintf("%s %s · сборка %d", AppName, meta.Version, meta.Build)
+	case cur.Build > 0:
+		return fmt.Sprintf("%s %s · сборка %d", AppName, cur.Version, cur.Build)
 	default:
-		return AppName + " " + meta.Version
+		return AppName + " " + cur.Version
 	}
 }
 
