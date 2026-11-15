@@ -107,13 +107,36 @@ func friendly(err error) error {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
 	}
+	// A transport error quotes the whole URL. Downloads are redirected to
+	// signed storage links several hundred characters long, so name the
+	// host only.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		host := "GitHub"
+		if u, perr := url.Parse(urlErr.URL); perr == nil && u.Host != "" {
+			host = u.Host
+		}
+		return &netError{host: host, err: urlErr.Err}
+	}
 	var netErr *net.OpError
 	var dnsErr *net.DNSError
 	if errors.As(err, &netErr) || errors.As(err, &dnsErr) {
-		return fmt.Errorf("нет связи с GitHub — проверьте подключение к интернету (%w)", err)
+		return &netError{host: "GitHub", err: err}
 	}
 	return err
 }
+
+// netError is a failure to reach a server at all.
+type netError struct {
+	host string
+	err  error
+}
+
+func (e *netError) Error() string {
+	return fmt.Sprintf("нет связи с %s — проверьте подключение к интернету (%v)", e.host, e.err)
+}
+
+func (e *netError) Unwrap() error { return e.err }
 
 func apiError(resp *http.Response, path string) error {
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
@@ -164,14 +187,25 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) (ht
 }
 
 // download streams a (possibly redirected) binary answer into w, refusing
-// more than limit bytes. Go drops the Authorization header when a redirect
-// leaves api.github.com, which is what the signed storage URLs expect.
+// more than limit bytes. Logs, archives and artifacts are served from
+// storage hosts through signed links: the token must not travel there, and
+// the storage rejects a request that carries one.
 func (c *Client) download(ctx context.Context, path string, w io.Writer, limit int64) error {
 	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient().Do(req)
+	client := *c.httpClient()
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("слишком много перенаправлений")
+		}
+		if next.URL.Host != via[0].URL.Host {
+			next.Header.Del("Authorization")
+		}
+		return nil
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return friendly(err)
 	}
@@ -199,7 +233,7 @@ type User struct {
 	// Scopes are the OAuth scopes of a classic token. Fine-grained tokens
 	// report none: their permissions cannot be read through the API.
 	Scopes []string `json:"-"`
-	// Classic is true when GitHub reported scopes for the token.
+	// Classic is true when GitHub reported at least one scope for the token.
 	Classic bool `json:"-"`
 }
 
@@ -220,14 +254,14 @@ func (c *Client) CurrentUser(ctx context.Context) (User, error) {
 	if err != nil {
 		return u, err
 	}
-	if _, ok := hdr["X-Oauth-Scopes"]; ok {
-		u.Classic = true
-		for _, s := range strings.Split(hdr.Get("X-Oauth-Scopes"), ",") {
-			if s = strings.TrimSpace(s); s != "" {
-				u.Scopes = append(u.Scopes, s)
-			}
+	for _, s := range strings.Split(hdr.Get("X-Oauth-Scopes"), ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			u.Scopes = append(u.Scopes, s)
 		}
 	}
+	// Tokens issued to GitHub Apps send the header too, but empty: their
+	// permissions are not scopes, so an empty list proves nothing.
+	u.Classic = len(u.Scopes) > 0
 	return u, nil
 }
 
