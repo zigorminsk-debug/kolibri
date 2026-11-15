@@ -1,0 +1,22 @@
+<% template "header" . %>
+
+jobs:
+  build:
+<% template "matrix" . %>
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Resolve dependencies
+        run: go mod tidy
+      - name: Test
+        run: go test ./...
+      - name: Build
+        shell: bash
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o dist/ ./...
+<% template "upload" . %>
+<%- template "release" . %>

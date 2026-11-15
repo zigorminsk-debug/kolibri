@@ -1,0 +1,22 @@
+<% template "header" . %>
+
+jobs:
+  build:
+<% template "matrix" . %>
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test
+        run: cargo test --release
+      - name: Build
+        run: cargo build --release
+      - name: Collect binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            find target/release -maxdepth 1 -type f -name '*.exe' -exec cp {} dist/ \;
+          else
+            find target/release -maxdepth 1 -type f -perm -u+x ! -name '*.*' -exec cp {} dist/ \;
+          fi
+<% template "upload" . %>
+<%- template "release" . %>

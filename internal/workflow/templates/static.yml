@@ -1,0 +1,20 @@
+<% template "header" . %>
+
+jobs:
+  build:
+    name: Build (web)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Collect site
+        run: |
+          test -f index.html
+          mkdir dist
+          rsync -a --exclude dist --exclude .git --exclude .github ./ dist/
+      - name: Upload build
+        uses: actions/upload-artifact@v7
+        with:
+          name: <% .AppName %>-web
+          path: dist/
+          if-no-files-found: error
+<%- template "release" . %>

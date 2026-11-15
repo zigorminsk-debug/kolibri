@@ -1,0 +1,15 @@
+# Этот файл создаёт и обновляет Kolibri Forge. Ручные правки будут перезаписаны.
+name: Kolibri Build
+
+on:
+  push:
+    branches: ["<% .Branch %>"]
+  workflow_dispatch:
+
+permissions:
+  contents: <% if .Release %>write<% else %>read<% end %>
+
+concurrency:
+  group: kolibri-build-${{ github.ref }}
+  cancel-in-progress: true
+

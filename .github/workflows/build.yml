@@ -1,0 +1,137 @@
+# Собирает Kolibri Forge под Windows, Linux и macOS при каждом изменении.
+# Готовые программы лежат в артефактах запуска; для ветки main и тегов v*
+# дополнительно публикуется релиз с прямыми ссылками на скачивание.
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FYNE_TOOLS: v1.7.4
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+      # The "ci" tag swaps Fyne's OpenGL driver for the software one, so the
+      # checks need no display and no system libraries.
+      - name: Vet
+        run: go vet -tags ci ./...
+      - name: Test
+        run: go test -race -tags ci ./...
+
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: windows-amd64, os: windows-latest }
+          - { target: linux-amd64, os: ubuntu-latest }
+          - { target: macos-arm64, os: macos-latest }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install Linux libraries for Fyne
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libgl1-mesa-dev libegl1-mesa-dev libwayland-dev libx11-dev libxkbcommon-dev xorg-dev
+      - name: Install the Fyne packaging tool
+        run: go install "fyne.io/tools/cmd/fyne@$FYNE_TOOLS"
+      - name: Stamp version
+        env:
+          BUILD: ${{ github.run_number }}
+        run: |
+          # The app shows these numbers in its settings window.
+          sed -i.bak -E "s/^( *Build = ).*/\1$BUILD/" FyneApp.toml
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            sed -i.bak -E "s/^( *Version = ).*/\1\"${GITHUB_REF_NAME#v}\"/" FyneApp.toml
+          fi
+          rm -f FyneApp.toml.bak
+          cat FyneApp.toml
+      - name: Package for Windows
+        if: runner.os == 'Windows'
+        run: |
+          fyne package --os windows --release
+          mkdir -p dist
+          7z a -tzip "dist/KolibriForge-${{ matrix.target }}.zip" "Kolibri Forge.exe"
+      - name: Package for Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p pack/KolibriForge dist
+          fyne build --os linux --release -o pack/KolibriForge/kolibri-forge
+          cp internal/ui/assets/icon.png pack/KolibriForge/kolibri-forge.png
+          tar -C pack -czf "dist/KolibriForge-${{ matrix.target }}.tar.gz" KolibriForge
+      - name: Package for macOS
+        if: runner.os == 'macOS'
+        run: |
+          fyne package --os darwin --release
+          # An ad-hoc signature keeps Gatekeeper from calling the app damaged.
+          codesign --force --deep --sign - "Kolibri Forge.app"
+          mkdir -p dist
+          ditto -c -k --keepParent "Kolibri Forge.app" "dist/KolibriForge-${{ matrix.target }}.zip"
+      - name: Upload build
+        uses: actions/upload-artifact@v7
+        with:
+          name: KolibriForge-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [test, build]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          ls -l dist
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "Kolibri Forge ${GITHUB_REF_NAME#v}" --generate-notes
+          else
+            gh release create "build-$RUN_NUMBER" dist/* --target "$GITHUB_SHA" --prerelease \
+              --title "Kolibri Forge, сборка $RUN_NUMBER" \
+              --notes "Автоматическая сборка из ветки main, коммит $GITHUB_SHA."
+          fi

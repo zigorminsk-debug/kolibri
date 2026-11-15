@@ -1,0 +1,28 @@
+<% template "header" . %>
+
+jobs:
+  build:
+<% template "matrix" . %>
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pyinstaller
+      - name: Check syntax
+        run: python -m compileall -q .
+      - name: Build
+        shell: bash
+        run: |
+          mode="--console"
+          if grep -rqE --include='*.py' '^[[:space:]]*(import|from)[[:space:]]+(tkinter|customtkinter|PyQt5|PyQt6|PySide2|PySide6|wx|kivy|pygame|flet)' .; then
+            mode="--windowed"
+          fi
+          pyinstaller --noconfirm --clean --onefile "$mode" --name "<% .AppName %>" main.py
+<% template "upload" . %>
+<%- template "release" . %>

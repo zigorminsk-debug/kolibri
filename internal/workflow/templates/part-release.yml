@@ -1,0 +1,32 @@
+<%- if .Release %>
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download builds
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: build-${{ github.run_number }}
+          TITLE: "Сборка №${{ github.run_number }}"
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          cd artifacts
+          # Artifacts lose the executable bit; restore it for binaries and scripts.
+          find . -type f | while IFS= read -r f; do
+            case "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" in
+              7f454c46|cffaedfe|cafebabe|2321*) chmod +x "$f" ;;
+            esac
+          done
+          for d in */; do
+            d="${d%/}"
+            (cd "$d" && zip -qr "../$d.zip" .)
+          done
+          gh release create "$TAG" ./*.zip --target "$GITHUB_SHA" --title "$TITLE" --notes "${NOTES:-Автоматическая сборка}"
+<%- end %>

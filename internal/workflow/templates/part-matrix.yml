@@ -1,0 +1,9 @@
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+<%- range .Matrix %>
+          - { target: <% .Target %>, os: <% .Runner %> }
+<%- end %>

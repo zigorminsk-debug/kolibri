@@ -1,0 +1,29 @@
+<% template "header" . %>
+
+jobs:
+  build:
+<% template "matrix" . %>
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: false
+      - name: Install Linux libraries for Fyne
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc libgl1-mesa-dev libegl1-mesa-dev libwayland-dev libx11-dev libxkbcommon-dev xorg-dev
+      - name: Resolve dependencies
+        run: go mod tidy
+      - name: Build
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          mkdir -p dist
+          flags="-s -w"
+          if [ "$RUNNER_OS" = "Windows" ]; then flags="$flags -H=windowsgui"; fi
+          go build -trimpath -ldflags "$flags" -o dist/ ./...
+<% template "upload" . %>
+<%- template "release" . %>

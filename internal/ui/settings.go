@@ -1,0 +1,294 @@
+package ui
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+
+	"github.com/zigorminsk-debug/kolibri/internal/colibri"
+	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
+)
+
+const (
+	autoModel   = "Первая на сервере"
+	newTokenURL = "https://github.com/settings/tokens/new?scopes=repo,workflow&description=Kolibri%20Forge"
+)
+
+func sectionTitle(s string) fyne.CanvasObject {
+	return container.New(layout.NewCustomPaddedLayout(10, 2, 0, 0), text(s, 15, colText, fyne.TextStyle{Bold: true}))
+}
+
+// status is a one-line result of a "check" button.
+type status struct{ label *widget.Label }
+
+func newStatus() *status {
+	l := widget.NewLabel("")
+	l.Wrapping = fyne.TextWrapWord
+	l.Hide()
+	return &status{label: l}
+}
+
+func (s *status) set(msg string, importance widget.Importance) {
+	s.label.Importance = importance
+	s.label.SetText(msg)
+	s.label.Show()
+}
+
+func (u *UI) showSettings() {
+	cfg := u.cfg
+
+	address := widget.NewEntry()
+	address.SetText(cfg.ColibriURL)
+	address.SetPlaceHolder("http://127.0.0.1:8000")
+	llmKey := widget.NewPasswordEntry()
+	llmKey.SetText(cfg.ColibriKey)
+	llmKey.SetPlaceHolder("не нужен, если сервер запущен без COLI_API_KEY")
+
+	modelOptions := func(models []colibri.Model) []string {
+		opts := []string{autoModel}
+		seen := false
+		for _, m := range models {
+			opts = append(opts, m.ID)
+			seen = seen || m.ID == cfg.Model
+		}
+		if cfg.Model != "" && !seen {
+			opts = append(opts, cfg.Model)
+		}
+		return opts
+	}
+	model := widget.NewSelect(modelOptions(u.models), nil)
+	if cfg.Model == "" {
+		model.SetSelected(autoModel)
+	} else {
+		model.SetSelected(cfg.Model)
+	}
+	llmStatus := newStatus()
+	var checkLLM *widget.Button
+	checkLLM = widget.NewButtonWithIcon("Проверить и обновить модели", theme.ViewRefreshIcon(), func() {
+		checkLLM.Disable()
+		llmStatus.set("Спрашиваю сервер…", widget.LowImportance)
+		client := &colibri.Client{BaseURL: address.Text, APIKey: strings.TrimSpace(llmKey.Text)}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			models, err := client.Models(ctx)
+			fyne.Do(func() {
+				checkLLM.Enable()
+				if err != nil {
+					llmStatus.set(capitalize(err.Error()), widget.DangerImportance)
+					return
+				}
+				if len(models) == 0 {
+					llmStatus.set("Сервер отвечает, но модель не загружена.", widget.WarningImportance)
+					return
+				}
+				current := model.Selected
+				model.Options = modelOptions(models)
+				model.SetSelected(current)
+				names := make([]string, len(models))
+				for i, m := range models {
+					names[i] = m.ID
+					if m.ContextLength > 0 {
+						names[i] += fmt.Sprintf(" (контекст %d)", m.ContextLength)
+					}
+				}
+				llmStatus.set("Колибри на связи: "+strings.Join(names, ", "), widget.SuccessImportance)
+			})
+		}()
+	})
+
+	temperature := widget.NewEntry()
+	temperature.SetText(strconv.FormatFloat(cfg.Temperature, 'f', -1, 64))
+	maxTokens := widget.NewEntry()
+	maxTokens.SetText(strconv.Itoa(cfg.MaxTokens))
+	idle := widget.NewEntry()
+	idle.SetText(strconv.Itoa(cfg.IdleTimeoutMin))
+
+	token := widget.NewPasswordEntry()
+	token.SetText(cfg.GitHubToken)
+	if cfg.GitHubToken == "" && cfg.Token() != "" {
+		token.SetPlaceHolder("используется токен из переменной окружения")
+	} else {
+		token.SetPlaceHolder("ghp_… или github_pat_…")
+	}
+	ghStatus := newStatus()
+	var checkGH *widget.Button
+	checkGH = widget.NewButtonWithIcon("Проверить токен", theme.ConfirmIcon(), func() {
+		value := strings.TrimSpace(token.Text)
+		if value == "" {
+			value = cfg.Token()
+		}
+		if value == "" {
+			ghStatus.set("Вставьте токен.", widget.DangerImportance)
+			return
+		}
+		checkGH.Disable()
+		ghStatus.set("Спрашиваю GitHub…", widget.LowImportance)
+		client := &ghapi.Client{Token: value}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			user, err := client.CurrentUser(ctx)
+			fyne.Do(func() {
+				checkGH.Enable()
+				switch {
+				case err != nil:
+					ghStatus.set(capitalize(err.Error()), widget.DangerImportance)
+				case !user.Classic:
+					ghStatus.set("Токен принят, аккаунт "+user.Login+". Это fine-grained токен: убедитесь, что у него есть Contents и Workflows — Read and write, и Actions — Read.", widget.SuccessImportance)
+				case !user.HasScope("repo") && !user.HasScope("public_repo"):
+					ghStatus.set("Токен принят, аккаунт "+user.Login+", но нет области repo — записать код не получится.", widget.WarningImportance)
+				case !user.HasScope("workflow"):
+					ghStatus.set("Токен принят, аккаунт "+user.Login+", но нет области workflow — GitHub не даст записать файл сборки.", widget.WarningImportance)
+				default:
+					ghStatus.set("Токен принят, аккаунт "+user.Login+". Права repo и workflow есть.", widget.SuccessImportance)
+				}
+			})
+		}()
+	})
+	tokenLink := widget.NewHyperlink("Создать токен с нужными правами", mustURL(newTokenURL))
+
+	outDir := widget.NewEntry()
+	outDir.SetText(cfg.OutputDir)
+	pick := widget.NewButtonWithIcon("Выбрать…", theme.FolderOpenIcon(), func() {
+		dialog.ShowFolderOpen(func(dir fyne.ListableURI, err error) {
+			if err == nil && dir != nil {
+				outDir.SetText(dir.Path())
+			}
+		}, u.win)
+	})
+
+	problem := newStatus()
+	row := func(label string, control fyne.CanvasObject) fyne.CanvasObject {
+		return container.NewVBox(fieldLabel(label), control)
+	}
+	three := container.NewGridWithColumns(3,
+		row("Температура", temperature),
+		row("Макс. токенов ответа", maxTokens),
+		row("Тишина до обрыва, мин", idle),
+	)
+	form := container.NewVBox(
+		sectionTitle("Колибри"),
+		row("Адрес сервера", address),
+		row("API-ключ", llmKey),
+		row("Модель", model),
+		container.NewHBox(checkLLM),
+		llmStatus.label,
+
+		sectionTitle("GitHub"),
+		row("Токен доступа", token),
+		hint("Classic-токену нужны области repo и workflow. Fine-grained — Contents и Workflows: Read and write, Actions: Read. Токен хранится в файле настроек на этом компьютере."),
+		container.NewHBox(checkGH, tokenLink),
+		ghStatus.label,
+
+		sectionTitle("Генерация"),
+		three,
+		hint("0 токенов — без ограничения: ответ может занять весь контекст модели. Колибри шлёт сигнал каждые 10 секунд; если сервер молчит дольше указанного, запрос обрывается."),
+
+		sectionTitle("Готовые сборки"),
+		row("Папка, куда скачивать программы", container.NewBorder(nil, nil, nil, pick, outDir)),
+		problem.label,
+		gap(0, 4),
+	)
+
+	var dlg *dialog.CustomDialog
+	save := widget.NewButtonWithIcon("Сохранить", theme.DocumentSaveIcon(), func() {
+		next := u.cfg
+		next.ColibriURL = strings.TrimSpace(address.Text)
+		if err := validAddress(next.ColibriURL); err != nil {
+			problem.set(capitalize(err.Error()), widget.DangerImportance)
+			return
+		}
+		next.ColibriKey = strings.TrimSpace(llmKey.Text)
+		next.Model = model.Selected
+		if next.Model == autoModel {
+			next.Model = ""
+		}
+		t, err := strconv.ParseFloat(strings.ReplaceAll(strings.TrimSpace(temperature.Text), ",", "."), 64)
+		if err != nil || t < 0 || t > 2 {
+			problem.set("Температура — число от 0 до 2, например 0.2.", widget.DangerImportance)
+			return
+		}
+		next.Temperature = t
+		n, err := strconv.Atoi(strings.TrimSpace(maxTokens.Text))
+		if err != nil || n < 0 {
+			problem.set("Макс. токенов — целое число, 0 означает «без ограничения».", widget.DangerImportance)
+			return
+		}
+		next.MaxTokens = n
+		m, err := strconv.Atoi(strings.TrimSpace(idle.Text))
+		if err != nil || m < 1 {
+			problem.set("Время тишины — целое число минут, не меньше 1.", widget.DangerImportance)
+			return
+		}
+		next.IdleTimeoutMin = m
+		next.GitHubToken = strings.TrimSpace(token.Text)
+		if dir := strings.TrimSpace(outDir.Text); dir != "" {
+			next.OutputDir = dir
+		}
+
+		u.formToConfig()
+		next.Repo, next.Branch, next.ProjectKind, next.Targets = u.cfg.Repo, u.cfg.Branch, u.cfg.ProjectKind, u.cfg.Targets
+		next.LastTask, next.MaxFixes, next.Private, next.Release = u.cfg.LastTask, u.cfg.MaxFixes, u.cfg.Private, u.cfg.Release
+		if err := u.Save(next); err != nil {
+			problem.set(capitalize(err.Error()), widget.DangerImportance)
+			return
+		}
+		u.cfg = next
+		u.clearProblem()
+		dlg.Hide()
+		u.CheckConnections()
+	})
+	save.Importance = widget.HighImportance
+	cancel := widget.NewButton("Отмена", func() { dlg.Hide() })
+
+	scroll := container.NewVScroll(container.New(layout.NewCustomPaddedLayout(0, 0, 4, 14), form))
+	buttons := container.New(layout.NewCustomPaddedLayout(8, 0, 0, 0),
+		container.NewHBox(container.NewCenter(text(u.versionLine(), 12, colFaint, fyne.TextStyle{})), layout.NewSpacer(), cancel, save))
+	content := container.NewBorder(nil, buttons, nil, nil, scroll)
+	dlg = dialog.NewCustomWithoutButtons("Настройки", content, u.win)
+	size := u.win.Canvas().Size()
+	dlg.Resize(fyne.NewSize(min(640, size.Width-40), min(720, size.Height-40)))
+	dlg.Show()
+}
+
+// versionLine names the build the user is running; the numbers are stamped
+// into the binary by the packaging step on GitHub Actions.
+func (u *UI) versionLine() string {
+	meta := u.app.Metadata()
+	switch {
+	case meta.Version == "":
+		return AppName + " · сборка из исходников"
+	case meta.Build > 0:
+		return fmt.Sprintf("%s %s · сборка %d", AppName, meta.Version, meta.Build)
+	default:
+		return AppName + " " + meta.Version
+	}
+}
+
+func validAddress(s string) error {
+	parsed, err := url.Parse(s)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return errors.New("адрес Колибри должен выглядеть как http://127.0.0.1:8000")
+	}
+	return nil
+}
+
+func mustURL(s string) *url.URL {
+	parsed, err := url.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	return parsed
+}

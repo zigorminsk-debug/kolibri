@@ -1,0 +1,15 @@
+<% template "header" . %>
+
+jobs:
+  build:
+<% template "matrix" . %>
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Install
+        run: cmake --install build --config Release --prefix dist
+<% template "upload" . %>
+<%- template "release" . %>

@@ -1,0 +1,308 @@
+package ui
+
+import (
+	"context"
+	"flag"
+	"image/png"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/test"
+
+	"github.com/zigorminsk-debug/kolibri/internal/config"
+	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
+	"github.com/zigorminsk-debug/kolibri/internal/pipeline"
+)
+
+var shots = flag.String("shots", "", "write screenshots of the main states into this directory")
+
+func newTestUI(t *testing.T, cfg config.Config, w, h float32) (*UI, fyne.Window) {
+	t.Helper()
+	app := test.NewTempApp(t)
+	app.Settings().SetTheme(Theme{})
+	win := app.NewWindow(AppName)
+	t.Cleanup(win.Close)
+	u := New(app, win, cfg)
+	u.Save = func(c config.Config) error { return nil }
+	win.Resize(fyne.NewSize(w, h))
+	return u, win
+}
+
+func snap(t *testing.T, win fyne.Window, name string) {
+	t.Helper()
+	if *shots == "" {
+		return
+	}
+	if err := os.MkdirAll(*shots, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(filepath.Join(*shots, name+".png"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := png.Encode(f, win.Canvas().Capture()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func demoConfig() config.Config {
+	cfg := config.Default()
+	cfg.ColibriURL = "http://127.0.0.1:1"
+	cfg.GitHubToken = ""
+	cfg.OutputDir = filepath.Join("C:", "Users", "igor", "KolibriForge")
+	cfg.Repo = "zigorminsk-debug/calc"
+	cfg.ProjectKind = "go-fyne"
+	cfg.LastTask = "Оконный калькулятор: четыре действия, проценты, история последних десяти вычислений. Тёмная тема, крупные кнопки, работа с клавиатуры."
+	return cfg
+}
+
+const demoReply = "SUMMARY: Калькулятор с историей\n\n=== FILE: go.mod ===\nmodule calc\n\ngo 1.22\n=== END FILE ===\n\n" +
+	"=== FILE: main.go ===\npackage main\n\nimport (\n\t\"fyne.io/fyne/v2/app\"\n\t\"fyne.io/fyne/v2/container\"\n\t\"fyne.io/fyne/v2/widget\"\n)\n\n" +
+	"func main() {\n\ta := app.New()\n\tw := a.NewWindow(\"Калькулятор\")\n\tdisplay := widget.NewLabel(\"0\")\n\thistory := widget.NewList(\n"
+
+func demoFiles() []pipeline.FileChange {
+	return []pipeline.FileChange{
+		{Path: ".github/workflows/kolibri-build.yml", Status: "new", Content: "name: Kolibri Build\non:\n  push:\n    branches: [\"main\"]\n"},
+		{Path: "calc/engine.go", Status: "new", Content: "package calc\n\n// Eval computes a op b.\nfunc Eval(a, b float64, op rune) (float64, error) {\n\tswitch op {\n\tcase '+':\n\t\treturn a + b, nil\n\tcase '-':\n\t\treturn a - b, nil\n\t}\n\treturn 0, errUnknown\n}\n"},
+		{Path: "go.mod", Status: "new", Content: "module calc\n\ngo 1.22\n"},
+		{Path: "main.go", Status: "changed", Content: strings.Repeat("package main\n\nfunc main() {\n\trun()\n}\n\n", 12)},
+		{Path: "old_notes.txt", Status: "deleted"},
+	}
+}
+
+func demoRuns(done, ok bool) []pipeline.RunStatus {
+	start := time.Now().Add(-3*time.Minute - 12*time.Second)
+	jobs := []ghapi.Job{
+		{Name: "Build (windows)", Status: "in_progress", StartedAt: start, Steps: []ghapi.Step{{Name: "Set up job", Status: "completed", Conclusion: "success"}, {Name: "Build", Status: "in_progress"}}},
+		{Name: "Build (linux)", Status: "completed", Conclusion: "success", StartedAt: start, CompletedAt: start.Add(2*time.Minute + 5*time.Second)},
+		{Name: "Release", Status: "queued"},
+	}
+	run := ghapi.Run{ID: 1, Name: "Kolibri Build", RunNumber: 7, Status: "in_progress", HTMLURL: "https://github.com/zigorminsk-debug/calc/actions/runs/1"}
+	if done {
+		run.Status = "completed"
+		run.Conclusion = "success"
+		jobs[0].Status, jobs[0].Conclusion, jobs[0].CompletedAt = "completed", "success", start.Add(3*time.Minute)
+		jobs[2].Status, jobs[2].Conclusion = "completed", "success"
+		if !ok {
+			run.Conclusion = "failure"
+			jobs[0].Conclusion = "failure"
+			jobs[0].Steps[1] = ghapi.Step{Name: "Build", Status: "completed", Conclusion: "failure"}
+			jobs[2].Conclusion = "skipped"
+		}
+	}
+	return []pipeline.RunStatus{{Run: run, Jobs: jobs}}
+}
+
+// play feeds the UI the events of a typical run up to the given stage.
+func play(u *UI, upTo pipeline.Stage) {
+	o := observer{u}
+	u.running = true
+	u.started = time.Now().Add(-4*time.Minute - 12*time.Second)
+	u.setFormEnabled(false)
+	o.Stage(pipeline.StagePrepare, 1, 4)
+	o.Log(pipeline.Info, "Колибри на связи: модель qwen3-coder-30b-a3b, контекст 65536 токенов")
+	o.Log(pipeline.Info, "GitHub: вошли как zigorminsk-debug")
+	o.Log(pipeline.Info, "Репозитория zigorminsk-debug/calc нет — создаю (приватный)")
+	if upTo < pipeline.StageGenerate {
+		return
+	}
+	o.Stage(pipeline.StageGenerate, 1, 4)
+	o.Log(pipeline.Info, "Отправляю запрос модели qwen3-coder-30b-a3b (2.4 КБ)")
+	o.ModelStart("Задача")
+	o.ModelDelta("Нужен калькулятор на Fyne. План: окно с дисплеем, сетка кнопок 4×5, список истории справа. Логику вычислений вынесу в отдельный пакет, чтобы её можно было проверить тестами без окна.\n", true)
+	o.ModelDelta(demoReply, false)
+	u.stream.flush()
+	if upTo < pipeline.StageCommit {
+		return
+	}
+	o.Log(pipeline.Info, "Ответ получен: 6.8 КБ, 1912 токенов за 5 мин 41 с (5.6 ток/с)")
+	o.Log(pipeline.Info, "Тип проекта: Go + Fyne — оконное приложение")
+	o.Files(demoFiles())
+	o.Stage(pipeline.StageCommit, 1, 4)
+	o.Log(pipeline.Good, "Коммит 3f9c2ab в zigorminsk-debug/calc (main): 4 файла — Калькулятор с историей")
+	if upTo < pipeline.StageBuild {
+		return
+	}
+	o.Stage(pipeline.StageBuild, 1, 4)
+	o.Log(pipeline.Info, "Жду, когда GitHub Actions начнёт сборку…")
+	o.Log(pipeline.Info, "Сборка №7 «Kolibri Build» запущена: https://github.com/zigorminsk-debug/calc/actions/runs/19284756102")
+	o.Build(demoRuns(false, true))
+}
+
+func TestScreens(t *testing.T) {
+	// 1. First start: nothing configured, nothing running.
+	cfg := config.Default()
+	cfg.ColibriURL = "http://127.0.0.1:1"
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+	u, win := newTestUI(t, cfg, 1240, 800)
+	u.llmChip.Set("Колибри · нет связи", toneBad)
+	u.ghChip.Set("GitHub · нужен токен", toneBad)
+	snap(t, win, "01-first-start")
+
+	u.onRunTapped()
+	if !u.problem.Visible() || !strings.Contains(u.problem.Text, "владелец/название") {
+		t.Errorf("empty form: problem = %q (visible %v)", u.problem.Text, u.problem.Visible())
+	}
+	snap(t, win, "02-validation")
+
+	// 2. A run in its stages.
+	u, win = newTestUI(t, demoConfig(), 1240, 800)
+	u.llmChip.Set("Колибри · qwen3-coder-30b-a3b · 64k", toneGood)
+	u.ghChip.Set("GitHub · zigorminsk-debug", toneGood)
+	snap(t, win, "03-ready")
+
+	play(u, pipeline.StageGenerate)
+	u.runBtn.SetText("Остановить")
+	u.tick()
+	if u.tabs.SelectedIndex() != 1 {
+		t.Errorf("generation should bring the model tab forward, got tab %d", u.tabs.SelectedIndex())
+	}
+	if got := u.stream.answer.String(); got != demoReply {
+		t.Errorf("stream answer differs from what the model sent (%d vs %d bytes)", len(got), len(demoReply))
+	}
+	snap(t, win, "04-generating")
+
+	play(u, pipeline.StageBuild)
+	u.tick()
+	if u.stages.states[3] != stageActive || u.stages.states[2] != stageDone || u.stages.states[4] != stagePending {
+		t.Errorf("stage states = %v", u.stages.states)
+	}
+	snap(t, win, "05-building")
+	u.tabs.SelectIndex(2)
+	snap(t, win, "06-files")
+	u.tabs.SelectIndex(0)
+	snap(t, win, "07-journal")
+
+	// 3. Outcomes.
+	observer{u}.Build(demoRuns(true, true))
+	observer{u}.Log(pipeline.Good, "Сборка №7 прошла за 3 мин 12 с")
+	observer{u}.Stage(pipeline.StageDeliver, 1, 4)
+	observer{u}.Log(pipeline.Good, "Релиз опубликован: https://github.com/zigorminsk-debug/calc/releases/tag/build-7")
+	out := pipeline.Outcome{
+		RepoURL: "https://github.com/zigorminsk-debug/calc", RunURL: "https://github.com/zigorminsk-debug/calc/actions/runs/1",
+		ReleaseURL: "https://github.com/zigorminsk-debug/calc/releases/tag/build-7",
+		Dir:        filepath.Join("C:", "Users", "igor", "KolibriForge", "calc", "build-7"), Attempts: 1,
+	}
+	u.finishRun(out, nil)
+	if !u.banner.Visible() || u.running || u.runBtn.Text != "Запустить" || u.repo.Disabled() {
+		t.Errorf("after success: banner=%v running=%v button=%q", u.banner.Visible(), u.running, u.runBtn.Text)
+	}
+	if u.stages.states[4] != stageDone {
+		t.Errorf("stage states after success = %v", u.stages.states)
+	}
+	snap(t, win, "08-success")
+
+	u.tabs.SelectIndex(3)
+	observer{u}.Build(demoRuns(true, false))
+	u.running = true
+	u.stage = pipeline.StageBuild
+	u.finishRun(pipeline.Outcome{RunURL: out.RunURL, RepoURL: out.RepoURL, Attempts: 4}, &pipeline.BuildFailedError{Attempts: 4, RunURL: out.RunURL})
+	if u.stages.states[3] != stageFailed {
+		t.Errorf("stage states after failure = %v", u.stages.states)
+	}
+	snap(t, win, "09-build-failed")
+
+	u.running = true
+	u.stage = pipeline.StageGenerate
+	u.finishRun(pipeline.Outcome{}, context.Canceled)
+	snap(t, win, "10-stopped")
+
+	// 4. Settings.
+	u.showSettings()
+	snap(t, win, "11-settings")
+
+	// 5. A small window must stay usable.
+	u, win = newTestUI(t, demoConfig(), 1000, 640)
+	u.llmChip.Set("Колибри · qwen3-coder-30b-a3b · 64k", toneGood)
+	u.ghChip.Set("GitHub · zigorminsk-debug · нет workflow", toneBusy)
+	play(u, pipeline.StageBuild)
+	u.tick()
+	snap(t, win, "12-small-window")
+
+	// The window must fit a 1024×768 screen even with the longest labels.
+	u.llmChip.Set("Колибри · "+shorten("a-very-long-model-identifier-q8-k-m", 20)+" · 128k", toneGood)
+	u.ghChip.Set("GitHub · "+shorten("a-very-long-github-login", 16)+" · нет workflow", toneBusy)
+	if min := win.Content().MinSize(); min.Width > 1000 || min.Height > 640 {
+		t.Errorf("minimum window size is %v, want at most 1000×640", min)
+	}
+}
+
+func TestFormValidation(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+	u, _ := newTestUI(t, config.Default(), 1240, 800)
+
+	u.repo.SetText("me/app")
+	if _, err := u.taskFromForm(); err == nil || !strings.Contains(err.Error(), "что нужно сделать") {
+		t.Errorf("empty prompt: err = %v", err)
+	}
+	u.prompt.SetText("сделай")
+	for _, c := range u.targets {
+		c.SetChecked(false)
+	}
+	if _, err := u.taskFromForm(); err == nil || !strings.Contains(err.Error(), "систему") {
+		t.Errorf("no targets: err = %v", err)
+	}
+	// A web project has no OS choice, so no targets is fine there.
+	for i, k := range u.kindInfos {
+		if k.Kind == "static" {
+			u.kind.SetSelectedIndex(i)
+		}
+	}
+	if !u.targets["windows"].Disabled() {
+		t.Error("OS checkboxes should be disabled for a static site")
+	}
+	task, err := u.taskFromForm()
+	if err != nil {
+		t.Fatalf("static site: %v", err)
+	}
+	if task.Owner != "me" || task.Repo != "app" || task.Kind != "static" || task.MaxFixes != 3 || !task.Private || !task.Release {
+		t.Errorf("task = %+v", task)
+	}
+
+	// Without a token the run must not start.
+	u.onRunTapped()
+	if u.running || !strings.Contains(u.problem.Text, "токен") {
+		t.Errorf("no token: running=%v problem=%q", u.running, u.problem.Text)
+	}
+}
+
+func TestFormSurvivesRestart(t *testing.T) {
+	u, _ := newTestUI(t, config.Default(), 1240, 800)
+	var saved config.Config
+	u.Save = func(c config.Config) error { saved = c; return nil }
+	u.repo.SetText("me/app")
+	u.branch.SetText("dev")
+	u.prompt.SetText("задача")
+	u.fixes.SetSelectedIndex(5)
+	u.targets["macos"].SetChecked(true)
+	u.release.SetChecked(false)
+	u.Stop()
+
+	u2, _ := newTestUI(t, saved, 1240, 800)
+	if u2.repo.Text != "me/app" || u2.branch.Text != "dev" || u2.prompt.Text != "задача" || u2.fixes.SelectedIndex() != 5 ||
+		!u2.targets["macos"].Checked || u2.release.Checked {
+		t.Errorf("restored form: %+v", saved)
+	}
+}
+
+func TestGroupDigitsAndClock(t *testing.T) {
+	if got := groupDigits(1234567); got != "1\u00a0234\u00a0567" {
+		t.Errorf("groupDigits = %q", got)
+	}
+	if got := groupDigits(999); got != "999" {
+		t.Errorf("groupDigits = %q", got)
+	}
+	if got := clock(4*time.Minute + 12*time.Second); got != "04:12" {
+		t.Errorf("clock = %q", got)
+	}
+	if got := clock(time.Hour + 61*time.Second); got != "1:01:01" {
+		t.Errorf("clock = %q", got)
+	}
+}

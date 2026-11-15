@@ -1,0 +1,15 @@
+# Build output
+/dist/
+/kolibri
+/kolibri-forge
+*.exe
+*.app/
+*.syso
+*.tar.gz
+*.tar.xz
+*.zip
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

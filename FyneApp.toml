@@ -1,0 +1,8 @@
+Website = "https://github.com/zigorminsk-debug/kolibri"
+
+[Details]
+  Icon = "internal/ui/assets/icon.png"
+  Name = "Kolibri Forge"
+  ID = "io.github.zigorminsk-debug.kolibri-forge"
+  Version = "1.0.0"
+  Build = 1
