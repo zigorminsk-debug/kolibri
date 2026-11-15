@@ -82,13 +82,14 @@ jobs:
           APP_NAME: Probe-App
           BUILD: ${{ github.run_number }}
         run: |
+          exec > >(tee "$RUNNER_TEMP/android.log") 2>&1
           sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
           if [ ! -d "$ndk" ] && [ -d "$sdk/ndk" ]; then
             ndk="$(find "$sdk/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
           fi
           if [ ! -d "$sdk" ] || [ ! -d "$ndk" ]; then
-            echo "::error title=Android::The runner has no Android SDK or NDK (ANDROID_HOME, ANDROID_NDK_LATEST_HOME)."
+            echo "::error title=Android::The runner has no Android SDK or NDK (ANDROID_HOME, ANDROID_NDK_HOME)."
             exit 1
           fi
           export ANDROID_HOME="$sdk" ANDROID_NDK_HOME="$ndk"
@@ -97,7 +98,10 @@ jobs:
           # The package needs an icon: the project's own, or a plain one.
           icon=Icon.png
           if [ ! -f "$icon" ]; then
-            declared="$(sed -nE 's/^[[:space:]]*Icon[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' FyneApp.toml 2>/dev/null | head -n 1)"
+            declared=""
+            if [ -f FyneApp.toml ]; then
+              declared="$(sed -nE 's/^[[:space:]]*Icon[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' FyneApp.toml | head -n 1 || true)"
+            fi
             if [ -n "$declared" ] && [ -f "$declared" ]; then
               icon="$declared"
             else
@@ -144,7 +148,7 @@ jobs:
           # The project's own name wins; the identifier is always ours, so
           # that it is valid for Android whatever the project declares.
           args=(--os android --app-id "$APP_ID" --icon "$icon" --app-version "1.0.$BUILD" --app-build "$BUILD")
-          if ! grep -Eqs '^[[:space:]]*Name[[:space:]]*=' FyneApp.toml; then
+          if [ ! -f FyneApp.toml ] || ! grep -Eq '^[[:space:]]*Name[[:space:]]*=' FyneApp.toml; then
             args+=(--name "$APP_NAME")
           fi
           "$(go env GOPATH)/bin/fyne" package "${args[@]}"
@@ -158,6 +162,7 @@ jobs:
             echo "ANDROID_HOME=${ANDROID_HOME:-} ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
             echo "NDK_LATEST=${ANDROID_NDK_LATEST_HOME:-} NDK_HOME=${ANDROID_NDK_HOME:-} NDK=${ANDROID_NDK:-}"
             go version
+            tail -n 25 "$RUNNER_TEMP/android.log" 2>&1 || true
             ls -la dist 2>&1 || true
             ls -la . 2>&1 | head -20
             bt="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
@@ -168,7 +173,7 @@ jobs:
               "$bt/apksigner" verify --print-certs "$f" 2>&1 | head -6
             done
           } > report.txt 2>&1
-          echo "::notice title=AndroidProbe::$(sed 's/%/%25/g' report.txt | cut -c1-300 | head -70 | awk '{printf "%s%%0A", $0}')"
+          echo "::notice title=AndroidProbe::$(sed 's/%/%25/g' report.txt | cut -c1-400 | head -90 | awk '{printf "%s%%0A", $0}')"
       - name: Upload build
         uses: actions/upload-artifact@v7
         with:
