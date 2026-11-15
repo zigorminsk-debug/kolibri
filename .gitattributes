@@ -1,2 +1,5 @@
+# Text is stored and checked out with LF on every system: the workflow
+# templates are embedded into the program as they are on disk.
+* text=auto eol=lf
 # The installer script is UTF-8 with BOM and CRLF, as Inno Setup expects.
 installer/*.iss -text

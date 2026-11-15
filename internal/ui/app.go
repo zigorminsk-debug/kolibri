@@ -641,6 +641,9 @@ func (u *UI) showResult(out pipeline.Outcome) {
 		parts = append(parts, "файлы — на странице сборки в GitHub")
 	}
 	detail := capitalize(strings.Join(parts, ", "))
+	if out.ReleaseError != "" {
+		detail += ". Релиз на GitHub не опубликован: " + out.ReleaseError
+	}
 	if out.Next != "" {
 		title = "Этап собран, работа не окончена"
 		detail += ". Модель записала в журнал работы, что осталось сделать: запустите задачу снова, чтобы продолжить."

@@ -30,6 +30,71 @@ func allGreen(runs []RunStatus) bool {
 	return true
 }
 
+// releaseOnlyFailure reports whether the program itself was built and the
+// only thing that went wrong is publishing the release. That is a problem
+// of the workflow or of the repository's settings: the model cannot fix it
+// by changing code, so it must not be asked to. The failed job is returned.
+func releaseOnlyFailure(runs []RunStatus) (ghapi.Job, bool) {
+	var release ghapi.Job
+	found := false
+	for _, s := range runs {
+		if s.Run.OK() {
+			continue
+		}
+		if !s.Run.Done() || s.Run.Name != workflow.RunName {
+			return ghapi.Job{}, false
+		}
+		built := false
+		for _, j := range s.Jobs {
+			switch {
+			case j.Name == workflow.ReleaseJob:
+				if !j.Failed() {
+					return ghapi.Job{}, false
+				}
+				release, found = j, true
+			case j.Status == "completed" && j.Conclusion == "success":
+				built = true
+			default:
+				// A build job failed, was cancelled or never ran.
+				return ghapi.Job{}, false
+			}
+		}
+		if !built {
+			return ghapi.Job{}, false
+		}
+	}
+	return release, found
+}
+
+// releaseProblem finds out why the release job failed, in a form fit for
+// the journal.
+func (r *Runner) releaseProblem(ctx context.Context, st *state, job ghapi.Job) string {
+	reason := ""
+	if notes, err := r.GH.Annotations(ctx, st.task.Owner, st.task.Repo, job.ID); err == nil {
+		for _, a := range notes {
+			msg := strings.TrimSpace(a.Message)
+			if a.Level != "failure" || msg == "" || strings.HasPrefix(msg, "Process completed with exit code") {
+				continue
+			}
+			reason = msg
+			if a.Title == "Release" {
+				break // the workflow's own explanation beats anything else
+			}
+		}
+	}
+	if reason == "" {
+		if step := job.FailedStep(); step != "" {
+			reason = "шаг «" + step + "» завершился с ошибкой"
+		} else {
+			reason = "задание завершилось с ошибкой"
+		}
+		if job.HTMLURL != "" {
+			reason += ", подробности: " + job.HTMLURL
+		}
+	}
+	return clip(strings.Join(strings.Fields(reason), " "), 400)
+}
+
 // build waits for the GitHub Actions runs of the current commit to finish.
 func (r *Runner) build(ctx context.Context, st *state) ([]RunStatus, error) {
 	owner, name, sha := st.task.Owner, st.task.Repo, st.head.Commit
@@ -84,7 +149,9 @@ func (r *Runner) build(ctx context.Context, st *state) ([]RunStatus, error) {
 				}
 				if !finished[s.Run.ID] {
 					finished[s.Run.ID] = true
-					if s.Run.OK() {
+					if _, onlyRelease := releaseOnlyFailure([]RunStatus{s}); onlyRelease {
+						r.logf(Good, "Сборка №%d прошла за %s; релиз не опубликован", s.Run.RunNumber, durationText(time.Since(started)))
+					} else if s.Run.OK() {
 						r.logf(Good, "Сборка №%d прошла за %s", s.Run.RunNumber, durationText(time.Since(started)))
 					} else {
 						r.logf(Bad, "Сборка №%d завершилась неудачно (%s)", s.Run.RunNumber, conclusionText(s.Run.Conclusion))
@@ -268,13 +335,13 @@ func (r *Runner) deliver(ctx context.Context, st *state, runs []RunStatus, out *
 	// The run produced by the managed workflow is the one with the product.
 	main := runs[0]
 	for _, s := range runs {
-		if s.Run.Name == "Kolibri Build" {
+		if s.Run.Name == workflow.RunName {
 			main = s
 		}
 	}
 	out.RunURL = main.Run.HTMLURL
 
-	if st.task.Release {
+	if st.task.Release && out.ReleaseError == "" {
 		tag := fmt.Sprintf("build-%d", main.Run.RunNumber)
 		if rel, err := r.GH.ReleaseByTag(ctx, owner, name, tag); err == nil {
 			out.ReleaseURL = rel.HTMLURL

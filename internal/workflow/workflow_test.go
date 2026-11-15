@@ -57,6 +57,68 @@ func TestRenderAllKinds(t *testing.T) {
 	}
 }
 
+// The release job must name every artifact it downloads. Asked for "all
+// artifacts", download-artifact unpacks a single one straight into the
+// folder and several ones into folders of their own — a job written for
+// one layout breaks on the other. That is how a project built for Windows
+// only lost its release.
+func TestReleaseDownloadsEachArtifactByName(t *testing.T) {
+	cases := []struct {
+		kind    Kind
+		targets []string
+		want    []string
+	}{
+		{Go, []string{"windows"}, []string{"app-windows"}},
+		{GoFyne, []string{"linux", "windows", "macos"}, []string{"app-windows", "app-linux", "app-macos"}},
+		{Static, nil, []string{"app-web"}},
+		{Node, []string{"linux"}, []string{"app-web"}},
+		{Generic, nil, []string{"app-source"}},
+	}
+	for _, c := range cases {
+		out, err := Render(Options{Kind: c.kind, Branch: "main", AppName: "app", Targets: c.targets, Release: true})
+		if err != nil {
+			t.Fatalf("%s: %v", c.kind, err)
+		}
+		_, release, ok := strings.Cut(out, "\n  release:\n")
+		if !ok {
+			t.Fatalf("%s: no release job:\n%s", c.kind, out)
+		}
+		if n := strings.Count(release, "uses: actions/download-artifact@"); n != len(c.want) {
+			t.Errorf("%s: %d download steps, want %d:\n%s", c.kind, n, len(c.want), release)
+		}
+		for _, name := range c.want {
+			step := "        with:\n          name: " + name + "\n          path: artifacts/" + name + "\n"
+			if !strings.Contains(release, step) {
+				t.Errorf("%s: release does not download %s into its own folder:\n%s", c.kind, name, release)
+			}
+			// What is downloaded must be what the build uploads.
+			if c.kind == Go || c.kind == GoFyne {
+				continue // uploaded as <app>-${{ matrix.target }}
+			}
+			if !strings.Contains(out, "uses: actions/upload-artifact@v7\n        with:\n          name: "+name+"\n") {
+				t.Errorf("%s: the build does not upload %s:\n%s", c.kind, name, out)
+			}
+		}
+		if !strings.Contains(release, "::error title=Release::") {
+			t.Errorf("%s: a failed release must explain itself in an annotation", c.kind)
+		}
+	}
+}
+
+// Built on Windows, the templates may arrive with CRLF line endings.
+func TestRenderHasNoCarriageReturns(t *testing.T) {
+	for name, text := range map[string]string{"part": "    steps:\r\n      - run: a\r\n", "whole": "a: 1\r\n<% template \"p\" . %>\r\nb: 2\r\n"} {
+		_ = name
+		if strings.Contains(cleanTemplate(text), "\r") {
+			t.Errorf("carriage return survived in %q", text)
+		}
+	}
+	out, err := Render(Options{Kind: Go, Branch: "main", AppName: "app", Targets: []string{"windows"}, Release: true})
+	if err != nil || strings.Contains(out, "\r") || strings.Contains(out, "\n\n\n") {
+		t.Errorf("err = %v, output has carriage returns or doubled blank lines:\n%q", err, out)
+	}
+}
+
 func TestRenderRejectsBadInput(t *testing.T) {
 	if _, err := Render(Options{Kind: Go, Branch: "main", AppName: "x"}); err == nil {
 		t.Error("no targets: expected an error")

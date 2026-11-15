@@ -171,6 +171,9 @@ type fakeGitHub struct {
 	noRuns bool
 	// denyWorkflow simulates a token without the workflow permission.
 	denyWorkflow bool
+	// releaseFails makes the Release job of every good build fail with
+	// this annotation, as a broken publishing step would.
+	releaseFails string
 	scopes       string
 	calls        []string
 }
@@ -437,7 +440,19 @@ func (g *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 		step := map[string]any{"name": "Build", "number": 3, "status": status, "conclusion": conclusion}
 		job := map[string]any{"id": run.id + 5000, "run_id": run.id, "name": "Build (linux)", "status": status, "conclusion": conclusion,
 			"html_url": "https://github.test/job", "steps": []any{step}}
-		writeJSON(w, 200, map[string]any{"jobs": []any{job}})
+		jobs := []any{job}
+		if g.releaseFails != "" && run.ok && status == "completed" {
+			jobs = append(jobs, map[string]any{"id": run.id + 7000, "run_id": run.id, "name": "Release", "status": "completed", "conclusion": "failure",
+				"html_url": "https://github.test/release-job", "steps": []any{map[string]any{"name": "Publish release", "number": 2, "status": "completed", "conclusion": "failure"}}})
+		}
+		writeJSON(w, 200, map[string]any{"jobs": jobs})
+
+	case strings.HasPrefix(rest, "/check-runs/") && strings.HasSuffix(rest, "/annotations"):
+		writeJSON(w, 200, []any{
+			map[string]any{"annotation_level": "failure", "message": "Process completed with exit code 1.", "path": ".github"},
+			map[string]any{"annotation_level": "failure", "title": "Release", "message": g.releaseFails, "path": ".github"},
+			map[string]any{"annotation_level": "notice", "message": "ubuntu-latest will migrate", "path": ".github"},
+		})
 
 	case strings.HasPrefix(rest, "/actions/jobs/") && strings.HasSuffix(rest, "/logs"):
 		var id int64
@@ -465,6 +480,9 @@ func (g *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 		w.Write(buf.Bytes())
 
 	case strings.HasPrefix(rest, "/releases/tags/"):
+		if g.releaseFails != "" {
+			g.t.Errorf("fake GitHub: a release that was not published must not be looked up")
+		}
 		tag := strings.TrimPrefix(rest, "/releases/tags/")
 		writeJSON(w, 200, map[string]string{"tag_name": tag, "html_url": "https://github.test/me/demo/releases/tag/" + tag})
 
@@ -505,6 +523,9 @@ func runState(run *fakeRun) (status string, conclusion any) {
 
 func (g *fakeGitHub) runJSON(run *fakeRun) map[string]any {
 	status, conclusion := runState(run)
+	if g.releaseFails != "" && status == "completed" {
+		conclusion = "failure" // one failed job fails the whole run
+	}
 	return map[string]any{"id": run.id, "name": "Kolibri Build", "status": status, "conclusion": conclusion, "run_number": run.number,
 		"head_sha": run.sha, "event": "push", "html_url": fmt.Sprintf("https://github.test/me/demo/actions/runs/%d", run.id)}
 }

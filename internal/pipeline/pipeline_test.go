@@ -714,3 +714,78 @@ func TestModelCannotWriteTheWorkLog(t *testing.T) {
 		t.Errorf("work log:\n%s", doc)
 	}
 }
+
+// The program is built, but the job that publishes the release fails. The
+// code is fine: the model must not be sent to "fix" it, and the user gets
+// the program with a note about the release.
+func TestRunDeliversWhenOnlyTheReleaseFails(t *testing.T) {
+	gh := newFakeGitHub(t)
+	gh.releaseFails = "HTTP 403: Resource not accessible by integration"
+	llm := newFakeLLM(t, func(int, []colibri.Message) fakeReply {
+		return fakeReply{content: goodReply("package main\n\nfunc main() {}\n")}
+	})
+	runner, rec := newRunner(t, llm, gh)
+	task := baseTask(t)
+
+	out, err := runner.Run(context.Background(), task)
+	if err != nil {
+		t.Fatalf("Run: %v\n%s", err, rec.journal())
+	}
+	if llm.count() != 1 || out.Attempts != 1 || len(gh.runs) != 1 {
+		t.Errorf("model requests = %d, attempts = %d, builds = %d: a failed release is not a reason to rewrite code", llm.count(), out.Attempts, len(gh.runs))
+	}
+	if out.ReleaseError != "HTTP 403: Resource not accessible by integration" || out.ReleaseURL != "" {
+		t.Errorf("release error = %q, url = %q", out.ReleaseError, out.ReleaseURL)
+	}
+	if out.Dir == "" || len(out.Artifacts) != 1 {
+		t.Errorf("the program was not delivered: %+v", out)
+	}
+	if _, err := os.Stat(filepath.Join(out.Dir, "demo-linux", "demo")); err != nil {
+		t.Errorf("downloaded binary: %v", err)
+	}
+	journal := rec.journal()
+	for _, want := range []string{"релиз опубликовать не удалось: HTTP 403: Resource not accessible by integration", "Код здесь ни при чём", "прошла за", "Готово: сборка лежит"} {
+		if !strings.Contains(journal, want) {
+			t.Errorf("journal lacks %q:\n%s", want, journal)
+		}
+	}
+	if strings.Contains(journal, "завершилась неудачно") || strings.Contains(journal, "Отправляю журнал ошибок модели") {
+		t.Errorf("journal calls a good build a failure:\n%s", journal)
+	}
+	if doc := gh.headFiles("main")[worklog.Path]; !strings.Contains(doc, "- **Итог:** сборка прошла") || !strings.Contains(doc, "релиз не опубликован: HTTP 403") {
+		t.Errorf("work log:\n%s", doc)
+	}
+	if got := rec.stages[len(rec.stages)-1]; got != "4:1/3" {
+		t.Errorf("last stage = %s, want delivery", got)
+	}
+}
+
+func TestReleaseOnlyFailure(t *testing.T) {
+	job := func(name, conclusion string) ghapi.Job {
+		return ghapi.Job{Name: name, Status: "completed", Conclusion: conclusion}
+	}
+	run := func(name, conclusion string, jobs ...ghapi.Job) RunStatus {
+		return RunStatus{Run: ghapi.Run{Name: name, Status: "completed", Conclusion: conclusion}, Jobs: jobs}
+	}
+	good := run("Kolibri Build", "failure", job("Build (windows)", "success"), job("Release", "failure"))
+	cases := []struct {
+		name string
+		runs []RunStatus
+		want bool
+	}{
+		{"build good, release failed", []RunStatus{good}, true},
+		{"next to a green run of another workflow", []RunStatus{run("Lint", "success"), good}, true},
+		{"everything green", []RunStatus{run("Kolibri Build", "success", job("Build (linux)", "success"), job("Release", "success"))}, false},
+		{"a build job failed, release skipped", []RunStatus{run("Kolibri Build", "failure", job("Build (windows)", "failure"), job("Release", "skipped"))}, false},
+		{"one target failed", []RunStatus{run("Kolibri Build", "failure", job("Build (windows)", "success"), job("Build (linux)", "failure"), job("Release", "failure"))}, false},
+		{"another workflow failed too", []RunStatus{run("Lint", "failure", job("lint", "failure")), good}, false},
+		{"a job named Release in a foreign workflow", []RunStatus{run("Deploy", "failure", job("build", "success"), job("Release", "failure"))}, false},
+		{"release failed and nothing was built", []RunStatus{run("Kolibri Build", "failure", job("Release", "failure"))}, false},
+		{"no runs", nil, false},
+	}
+	for _, c := range cases {
+		if _, got := releaseOnlyFailure(c.runs); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
+	}
+}

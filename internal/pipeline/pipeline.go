@@ -113,6 +113,9 @@ type Outcome struct {
 	Next string
 	// LogURL is the work log in the repository, "" before the first commit.
 	LogURL string
+	// ReleaseError says why the release was not published although the
+	// program was built; "" when there is nothing to report.
+	ReleaseError string
 }
 
 // InterruptedError means the model's reply broke off (the server stopped,
@@ -309,7 +312,14 @@ func (r *Runner) Run(ctx context.Context, task Task) (out Outcome, err error) {
 		if err != nil {
 			return out, err
 		}
-		if allGreen(runs) {
+		releaseJob, releaseOnly := releaseOnlyFailure(runs)
+		if releaseOnly {
+			// The program is built; only its publication failed. Changing
+			// the code cannot help, so the model is not asked to.
+			out.ReleaseError = r.releaseProblem(ctx, st, releaseJob)
+			r.logf(Warn, "Программа собрана, но релиз опубликовать не удалось: %s. Код здесь ни при чём — исправлять его не нужно; файлы сборки скачиваю как обычно", out.ReleaseError)
+		}
+		if allGreen(runs) || releaseOnly {
 			r.Obs.Stage(StageDeliver, attempt, total)
 			r.deliver(ctx, st, runs, &out)
 			if st.next != "" {
@@ -362,6 +372,9 @@ func (r *Runner) closeLog(ctx context.Context, st *state, out *Outcome, runErr e
 		}
 		if out.ReleaseURL != "" {
 			note += "; релиз " + out.ReleaseURL
+		}
+		if out.ReleaseError != "" {
+			note += "; релиз не опубликован: " + out.ReleaseError
 		}
 	case errors.As(runErr, &failed):
 		note = failed.Error()

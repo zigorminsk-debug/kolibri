@@ -171,6 +171,13 @@ var runners = map[string]string{
 	"macos":   "macos-latest",
 }
 
+// RunName is the name of the managed workflow, as GitHub shows it for a run.
+const RunName = "Kolibri Build"
+
+// ReleaseJob is the name of the job that publishes the release. It runs
+// after the build jobs and its failure says nothing about the code.
+const ReleaseJob = "Release"
+
 // TargetNames lists the supported build targets in display order.
 func TargetNames() []string { return []string{"windows", "linux", "macos"} }
 
@@ -191,7 +198,7 @@ func loadTemplates() (*template.Template, error) {
 			return nil, err
 		}
 		name := strings.TrimSuffix(e.Name(), ".yml")
-		text := string(data)
+		text := cleanTemplate(string(data))
 		if part, ok := strings.CutPrefix(name, "part-"); ok {
 			// Parts are spliced into the middle of a line structure.
 			name, text = part, strings.TrimRight(text, "\n")
@@ -202,6 +209,11 @@ func loadTemplates() (*template.Template, error) {
 	}
 	return root, nil
 }
+
+// cleanTemplate drops carriage returns: a checkout on Windows may hand the
+// templates over with CRLF, and a part trimmed of its last line feed would
+// keep a stray CR in the middle of the file.
+func cleanTemplate(text string) string { return strings.ReplaceAll(text, "\r", "") }
 
 // Render produces the workflow file for a project.
 func Render(opts Options) (string, error) {
@@ -231,12 +243,28 @@ func Render(opts Options) (string, error) {
 		sort.Slice(matrix, func(i, j int) bool { return order[matrix[i].Target] < order[matrix[j].Target] })
 	}
 
+	app := SafeName(opts.AppName)
+	// Every artifact the build uploads, by name: the release job fetches
+	// them one by one, so it does not depend on how many there are.
+	var artifacts []string
+	for _, row := range matrix {
+		artifacts = append(artifacts, app+"-"+row.Target)
+	}
+	if !info.PerOS {
+		suffix := "web"
+		if opts.Kind == Generic {
+			suffix = "source"
+		}
+		artifacts = []string{app + "-" + suffix}
+	}
+
 	data := struct {
-		Branch  string
-		AppName string
-		Matrix  []matrixRow
-		Release bool
-	}{branch, SafeName(opts.AppName), matrix, opts.Release}
+		Branch    string
+		AppName   string
+		Matrix    []matrixRow
+		Artifacts []string
+		Release   bool
+	}{branch, app, matrix, artifacts, opts.Release}
 
 	var buf bytes.Buffer
 	if err := templates.ExecuteTemplate(&buf, string(opts.Kind), data); err != nil {
