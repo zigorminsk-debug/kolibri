@@ -14,6 +14,15 @@
 //	- what is left to do, when the task did not fit into one reply
 //	=== END NEXT ===
 //
+//	=== NOTES ===
+//	short notes on findings or the next step
+//	=== END NOTES ===
+//
+//	=== WEB ===
+//	{"action":"search","query":"..."}
+//	{"action":"open","url":"https://..."}
+//	=== END WEB ===
+//
 // Local models drift from formats, so the parser is forgiving: a missing END
 // marker, Markdown fences around the content, and a plain Markdown reply
 // ("### main.go" followed by a fenced block) are all understood.
@@ -25,6 +34,8 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/zigorminsk-debug/kolibri/internal/lightpanda"
 )
 
 // File is one change: new content for Path, or its removal.
@@ -50,6 +61,12 @@ type Result struct {
 	// Next is the model's note on what remains to be done, empty when it
 	// considers the task finished.
 	Next string
+	// Web lists browser actions the model asked Kolibri Forge to carry out
+	// with Lightpanda before continuing.
+	Web []lightpanda.Action
+	// Notes holds the model's brief findings or plan from a === NOTES ===
+	// section, when present.
+	Notes string
 }
 
 // ErrNoFiles means the reply held no file blocks at all.
@@ -77,13 +94,16 @@ func Parse(reply string, cutOff bool) (Result, error) {
 		reply = reply[:i]
 	}
 
-	res := parseBlocks(reply, cutOff)
+	res, rest := parseBlocks(reply, cutOff)
 	if len(res.Files) == 0 && !res.Truncated {
-		md := parseMarkdown(reply, cutOff)
+		md := parseMarkdown(rest, cutOff)
 		md.Rejected = append(res.Rejected, md.Rejected...)
 		if md.Summary == "" {
 			md.Summary = res.Summary
 		}
+		md.Next = res.Next
+		md.Web = res.Web
+		md.Notes = res.Notes
 		res = md
 	}
 	res.Files = dedupe(res.Files)
@@ -93,7 +113,10 @@ func Parse(reply string, cutOff bool) (Result, error) {
 	return res, nil
 }
 
-func parseBlocks(reply string, cutOff bool) Result {
+// parseBlocks reads === ... === sections and also returns the lines outside
+// === WEB === / === NOTES === / === NEXT === sections so the Markdown fallback
+// never mistakes a fenced web action for a repository file.
+func parseBlocks(reply string, cutOff bool) (Result, string) {
 	var res Result
 	lines := strings.Split(reply, "\n")
 
@@ -115,18 +138,79 @@ func parseBlocks(reply string, cutOff bool) Result {
 
 	inNext := false
 	var next []string
+	inWeb := false
+	var web []string
+	closeWeb := func() {
+		if !inWeb {
+			return
+		}
+		inWeb = false
+		res.Web = append(res.Web, parseWebBlock(web)...)
+		web = nil
+	}
+	inNotes := false
+	var notes []string
+	var outside []string
+
 	for _, line := range lines {
 		if m := fileMarker.FindStringSubmatch(line); m != nil {
 			closeFile()
-			inNext = false
+			closeWeb()
+			inNext, inNotes = false, false
 			open, curPath, buf = true, m[1], nil
 			continue
 		}
-		// Inside a file the word NEXT between equals signs is content only
-		// when the file is still open; models close files before the note.
-		if !open && nextMarker.MatchString(line) {
-			inNext = true
-			continue
+		if !open {
+			if webMarker.MatchString(line) {
+				closeWeb()
+				inNext, inNotes = false, false
+				inWeb = true
+				continue
+			}
+			if notesMarker.MatchString(line) {
+				closeWeb()
+				inNext = false
+				inNotes = true
+				continue
+			}
+			// Inside a file the word NEXT between equals signs is content only
+			// when the file is still open; models close files before the note.
+			if nextMarker.MatchString(line) {
+				closeWeb()
+				inNotes = false
+				inNext = true
+				continue
+			}
+			if m := webInlineMarker.FindStringSubmatch(line); m != nil {
+				closeWeb()
+				inNext, inNotes = false, false
+				res.Web = append(res.Web, parseInlineWeb(m[1], m[2])...)
+				continue
+			}
+		}
+		if inWeb {
+			if endWebMarker.MatchString(line) {
+				closeWeb()
+				continue
+			}
+			if deleteMarker.MatchString(line) {
+				closeWeb()
+			} else {
+				web = append(web, line)
+				continue
+			}
+		}
+		if inNotes {
+			if endNotesMarker.MatchString(line) {
+				inNotes = false
+				continue
+			}
+			if deleteMarker.MatchString(line) {
+				inNotes = false
+			} else {
+				notes = append(notes, line)
+				continue
+			}
 		}
 		if inNext {
 			if endMarker.MatchString(line) {
@@ -157,12 +241,14 @@ func parseBlocks(reply string, cutOff bool) Result {
 			buf = append(buf, line)
 			continue
 		}
+		outside = append(outside, line)
 		if res.Summary == "" && len(res.Files) == 0 {
 			if m := summaryLine.FindStringSubmatch(line); m != nil {
 				res.Summary = cleanSummary(m[1])
 			}
 		}
 	}
+	closeWeb()
 	if open {
 		if cutOff {
 			res.Truncated = true
@@ -172,7 +258,8 @@ func parseBlocks(reply string, cutOff bool) Result {
 		}
 	}
 	res.Next = cleanNext(next)
-	return res
+	res.Notes = cleanNext(notes)
+	return res, strings.Join(outside, "\n")
 }
 
 // cleanNext trims the note and drops one that only says "nothing".

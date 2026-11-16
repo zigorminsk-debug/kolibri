@@ -84,3 +84,37 @@ func TestSplitRepo(t *testing.T) {
 		}
 	}
 }
+
+func TestWebSettingsDefaultsAndClamping(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	// Legacy config without web fields inherits enabled defaults.
+	if err := os.WriteFile(path, []byte(`{"colibri_url":"http://127.0.0.1:8000"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFrom(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.UseWeb || cfg.MaxWebSteps != 8 || cfg.WebTimeoutSec != 30 || cfg.SearchProvider != "auto" {
+		t.Fatalf("legacy migration = %+v", cfg)
+	}
+
+	// Explicit false and clamped limits round-trip faithfully.
+	cfg.UseWeb = false
+	cfg.LightpandaURL = " http://127.0.0.1:9222 "
+	cfg.SearchProvider = " BRAVE "
+	cfg.SearchAPIKey = " bsa_key "
+	cfg.MaxWebSteps = 99
+	cfg.WebTimeoutSec = 500
+	if err := cfg.SaveTo(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadFrom(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UseWeb || got.LightpandaURL != "http://127.0.0.1:9222" || got.SearchProvider != "brave" ||
+		got.SearchAPIKey != "bsa_key" || got.MaxWebSteps != 20 || got.WebTimeoutSec != 180 {
+		t.Fatalf("web settings = %+v", got)
+	}
+}

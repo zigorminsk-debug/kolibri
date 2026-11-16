@@ -29,6 +29,18 @@ type Config struct {
 	// on signing in through the browser; without it the app asks for a token.
 	GitHubClientID string `json:"github_client_id,omitempty"`
 
+	// Lightpanda browser for web search and documentation lookup when Colibri
+	// asks Kolibri Forge for information from the internet.
+	UseWeb           bool   `json:"use_web"`
+	LightpandaPath   string `json:"lightpanda_path,omitempty"`
+	LightpandaURL    string `json:"lightpanda_url,omitempty"`
+	LightpandaProxy  string `json:"lightpanda_proxy,omitempty"`
+	LightpandaRobots bool   `json:"lightpanda_robots,omitempty"`
+	SearchProvider   string `json:"search_provider,omitempty"`
+	SearchAPIKey     string `json:"search_api_key,omitempty"`
+	MaxWebSteps      int    `json:"max_web_steps"`
+	WebTimeoutSec    int    `json:"web_timeout_sec"`
+
 	// Where finished builds are unpacked.
 	OutputDir string `json:"output_dir"`
 
@@ -57,6 +69,10 @@ func Default() Config {
 		ColibriURL:     "http://127.0.0.1:8000",
 		Temperature:    0.2,
 		IdleTimeoutMin: 15,
+		UseWeb:         true,
+		SearchProvider: "auto",
+		MaxWebSteps:    8,
+		WebTimeoutSec:  30,
 		OutputDir:      defaultOutputDir(),
 		ProjectKind:    "auto",
 		CheckUpdates:   true,
@@ -151,6 +167,14 @@ func (c *Config) normalize() {
 	c.ColibriKey = strings.TrimSpace(c.ColibriKey)
 	c.GitHubToken = strings.TrimSpace(c.GitHubToken)
 	c.GitHubClientID = strings.TrimSpace(c.GitHubClientID)
+	c.LightpandaPath = strings.TrimSpace(c.LightpandaPath)
+	c.LightpandaURL = strings.TrimSpace(c.LightpandaURL)
+	c.LightpandaProxy = strings.TrimSpace(c.LightpandaProxy)
+	c.SearchProvider = strings.ToLower(strings.TrimSpace(c.SearchProvider))
+	if c.SearchProvider == "" {
+		c.SearchProvider = d.SearchProvider
+	}
+	c.SearchAPIKey = strings.TrimSpace(c.SearchAPIKey)
 	c.Repo = strings.TrimSpace(c.Repo)
 	c.Branch = strings.TrimSpace(c.Branch)
 	if c.Temperature < 0 {
@@ -164,6 +188,18 @@ func (c *Config) normalize() {
 	}
 	if c.IdleTimeoutMin <= 0 {
 		c.IdleTimeoutMin = d.IdleTimeoutMin
+	}
+	if c.MaxWebSteps <= 0 {
+		c.MaxWebSteps = d.MaxWebSteps
+	}
+	if c.MaxWebSteps > 20 {
+		c.MaxWebSteps = 20
+	}
+	if c.WebTimeoutSec < 5 {
+		c.WebTimeoutSec = d.WebTimeoutSec
+	}
+	if c.WebTimeoutSec > 180 {
+		c.WebTimeoutSec = 180
 	}
 	if strings.TrimSpace(c.OutputDir) == "" {
 		c.OutputDir = d.OutputDir

@@ -2,12 +2,16 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"image/png"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +24,7 @@ import (
 
 	"github.com/zigorminsk-debug/kolibri/internal/config"
 	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
+	"github.com/zigorminsk-debug/kolibri/internal/lightpanda"
 	"github.com/zigorminsk-debug/kolibri/internal/pipeline"
 	"github.com/zigorminsk-debug/kolibri/internal/runlog"
 )
@@ -186,7 +191,7 @@ func TestScreens(t *testing.T) {
 		t.Errorf("stage states = %v", u.stages.states)
 	}
 	snap(t, win, "05-building")
-	u.tabs.SelectIndex(2)
+	u.tabs.SelectIndex(3)
 	snap(t, win, "06-files")
 	u.tabs.SelectIndex(0)
 	snap(t, win, "07-journal")
@@ -210,7 +215,7 @@ func TestScreens(t *testing.T) {
 	}
 	snap(t, win, "08-success")
 
-	u.tabs.SelectIndex(3)
+	u.tabs.SelectIndex(4)
 	observer{u}.Build(demoRuns(true, false))
 	u.running = true
 	u.stage = pipeline.StageBuild
@@ -556,4 +561,147 @@ func bannerText(u *UI) string {
 	}
 	rec(u.banner)
 	return b.String()
+}
+
+func TestWebResearchViewAndSettings(t *testing.T) {
+	u, win := newTestUI(t, demoConfig(), 1240, 800)
+	if !u.useWeb.Checked {
+		t.Fatal("web search must be enabled by default")
+	}
+	task, err := u.taskFromForm()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !task.UseWeb || task.MaxWebSteps != 8 {
+		t.Errorf("task web fields = UseWeb:%v MaxWebSteps:%d", task.UseWeb, task.MaxWebSteps)
+	}
+
+	// Simulate Lightpanda executing search + page read + cached lookup.
+	steps := []pipeline.WebStep{
+		{
+			Index: 1, Round: 1, Attempt: 1,
+			Action:   lightpanda.Action{Kind: "search", Query: "radmin vpn architecture"},
+			Content:  "1. Radmin VPN — https://www.radmin-vpn.com/\n   Virtual local network.",
+			Duration: 420 * time.Millisecond,
+		},
+		{
+			Index: 2, Round: 2, Attempt: 1,
+			Action:  lightpanda.Action{Kind: "open", URL: "https://www.radmin-vpn.com/"},
+			URL:     "https://www.radmin-vpn.com/",
+			Title:   "Radmin VPN",
+			Running: true,
+		},
+	}
+	observer{u}.Web(steps)
+	if u.webTab.Text != "Интернет (2)" || u.web.empty.Visible() {
+		t.Fatalf("webTab=%q empty=%v", u.webTab.Text, u.web.empty.Visible())
+	}
+	if !u.web.openBtn.Visible() || !strings.Contains(u.web.curText, "выполняет действие") {
+		t.Errorf("running step: openBtn=%v text=%q", u.web.openBtn.Visible(), u.web.curText)
+	}
+
+	// Complete step 2 and append cached step 3.
+	steps[1].Running = false
+	steps[1].Content = "# Radmin VPN\nEncrypted peer-to-peer mesh over UDP."
+	steps[1].Duration = 650 * time.Millisecond
+	steps = append(steps, pipeline.WebStep{
+		Index: 3, Round: 3, Attempt: 1,
+		Action:  lightpanda.Action{Kind: "search", Query: "radmin vpn architecture"},
+		Content: steps[0].Content,
+		Cached:  true,
+	})
+	observer{u}.Web(steps)
+	u.tabs.SelectIndex(2)
+	if u.webTab.Text != "Интернет (3)" {
+		t.Errorf("webTab = %q", u.webTab.Text)
+	}
+	u.web.list.Select(1)
+	if !strings.Contains(u.web.curText, "Encrypted peer-to-peer mesh") || !u.web.openBtn.Visible() {
+		t.Errorf("step 2 preview = %q (openBtn=%v)", u.web.curText, u.web.openBtn.Visible())
+	}
+	test.Tap(u.web.copyBtn)
+	if !strings.Contains(u.app.Clipboard().Content(), "Encrypted peer-to-peer mesh") {
+		t.Errorf("clipboard = %q", u.app.Clipboard().Content())
+	}
+	snap(t, win, "32-web-research")
+
+	// Result banner records how many browser steps were run.
+	u.running = true
+	u.finishRun(pipeline.Outcome{
+		RepoURL:  "https://github.com/zigorminsk-debug/localvpn",
+		Dir:      filepath.Join("C:", "Users", "igor", "KolibriForge", "localvpn", "build-1"),
+		Attempts: 1,
+		WebSteps: 3,
+	}, nil)
+	if got := bannerText(u); !strings.Contains(got, "3 действия в интернете") {
+		t.Errorf("banner missing web count: %q", got)
+	}
+
+	// Settings dialog validates ws:// vs http:// MCP URL and saves web options.
+	var saved config.Config
+	u.Save = func(c config.Config) error { saved = c; return nil }
+	u.useWeb.SetChecked(false)
+	u.showSettings()
+	mcpEntry := findEntry(t, u, "http://127.0.0.1:9222 — не обязательно (lightpanda mcp --port 9222)")
+	mcpEntry.SetText("ws://127.0.0.1:9222")
+	test.Tap(findButton(t, u, "Сохранить"))
+	if saved.LightpandaURL != "" {
+		t.Fatal("ws:// CDP address should have been rejected")
+	}
+	mcpEntry.SetText("http://127.0.0.1:9222")
+	test.Tap(findButton(t, u, "Сохранить"))
+	if saved.LightpandaURL != "http://127.0.0.1:9222/mcp" && saved.LightpandaURL != "http://127.0.0.1:9222" {
+		t.Errorf("saved LightpandaURL = %q", saved.LightpandaURL)
+	}
+	if saved.UseWeb {
+		t.Error("unchecked useWeb should persist as false")
+	}
+
+	// One-click Lightpanda installation and verification from Settings.
+	if runtime.GOOS != "windows" {
+		asset := lightpanda.AssetName(runtime.GOOS, runtime.GOARCH)
+		if asset != "" {
+			relSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/repos/lightpanda-io/browser/releases":
+					_ = json.NewEncoder(w).Encode([]map[string]any{{
+						"tag_name": "1.0.4",
+						"assets":   []map[string]any{{"name": asset, "browser_download_url": "http://" + r.Host + "/bin", "size": 58}},
+					}})
+				case "/bin":
+					w.Write([]byte("#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo 1.0.4; exit 0; fi\n"))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer relSrv.Close()
+
+			u.cfg.LightpandaURL = ""
+			u.lpManagedDir = t.TempDir()
+			u.lpReleasesURL = relSrv.URL
+			u.showSettings()
+			test.Tap(findButton(t, u, "Установить Lightpanda"))
+			u.bg.Wait()
+			var sawInstalled bool
+			walk(u, func(o fyne.CanvasObject) {
+				if l, ok := o.(*widget.Label); ok && strings.Contains(l.Text, "Установлено: Lightpanda 1.0.4") {
+					sawInstalled = true
+				}
+			})
+			if !sawInstalled {
+				t.Error("Settings did not show installed Lightpanda 1.0.4 confirmation")
+			}
+			test.Tap(findButton(t, u, "Проверить Lightpanda"))
+			u.bg.Wait()
+			var sawChecked bool
+			walk(u, func(o fyne.CanvasObject) {
+				if l, ok := o.(*widget.Label); ok && strings.HasPrefix(l.Text, "Lightpanda 1.0.4 (") {
+					sawChecked = true
+				}
+			})
+			if !sawChecked {
+				t.Error("Settings check button did not report Lightpanda 1.0.4")
+			}
+		}
+	}
 }

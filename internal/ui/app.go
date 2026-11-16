@@ -45,11 +45,14 @@ type UI struct {
 	Save func(config.Config) error
 
 	// Test hooks: stand-ins for api.github.com and github.com, for the
-	// version stamped into the binary and for the operating system.
-	ghBaseURL    string
-	oauthBaseURL string
-	version      *update.Current
-	goosOverride string
+	// version stamped into the binary, for Lightpanda installation and for
+	// the operating system.
+	ghBaseURL     string
+	oauthBaseURL  string
+	lpReleasesURL string
+	lpManagedDir  string
+	version       *update.Current
+	goosOverride  string
 
 	// update strip under the header, and what it offers
 	top          *fyne.Container
@@ -84,6 +87,7 @@ type UI struct {
 	formTop    *fyne.Container
 	prompt     *widget.Entry
 	fixes      *widget.Select
+	useWeb     *widget.Check
 	private    *widget.Check
 	release    *widget.Check
 	problem    *widget.Label
@@ -99,9 +103,11 @@ type UI struct {
 	head    *fyne.Container
 	body    *fyne.Container
 	tabs    *container.AppTabs
+	webTab  *container.TabItem
 
 	journal *journal
 	stream  *streamView
+	web     *webView
 	files   *filesView
 	build   *buildView
 
@@ -284,10 +290,11 @@ func (u *UI) formPanel() fyne.CanvasObject {
 
 	u.prompt = widget.NewMultiLineEntry()
 	u.prompt.Wrapping = fyne.TextWrapWord
-	u.prompt.SetPlaceHolder("Например: оконный калькулятор с историей вычислений и тёмной темой")
+	u.prompt.SetPlaceHolder("Например: посмотри как устроена программа Radmin VPN и сделай аналогичную для локального использования")
 	u.prompt.OnChanged = func(string) { u.clearProblem() }
 
 	u.fixes = widget.NewSelect([]string{"не исправлять", "1 раз", "2 раза", "3 раза", "4 раза", "5 раз"}, nil)
+	u.useWeb = widget.NewCheck("Поиск в интернете (Lightpanda)", nil)
 	u.private = widget.NewCheck("Новый репозиторий — приватный", nil)
 	u.release = widget.NewCheck("Публиковать релиз после сборки", nil)
 
@@ -314,11 +321,11 @@ func (u *UI) formPanel() fyne.CanvasObject {
 		u.targetHint,
 		fieldLabel("Что нужно сделать"),
 	)
+	checks := container.NewThemeOverride(container.NewVBox(u.useWeb, u.private, u.release), denseTheme{})
 	u.formFoot = container.NewVBox(
 		gap(0, 2),
 		container.NewBorder(nil, nil, container.NewCenter(text("Чинить упавшую сборку", 13.5, colText, fyne.TextStyle{})), fixed(130, u.fixes.MinSize().Height, u.fixes)),
-		u.private,
-		u.release,
+		checks,
 		u.problem,
 		gap(0, 2),
 		u.runBtn,
@@ -342,12 +349,15 @@ func (u *UI) progressPanel() fyne.CanvasObject {
 	u.journal = newJournal(u.copyText)
 	u.journal.openDir = u.openFolder
 	u.stream = newStreamView(u.copyText)
+	u.web = newWebView(u.openURL, u.copyText)
 	u.files = newFilesView()
 	u.build = newBuildView(u.openURL)
 
+	u.webTab = container.NewTabItem("Интернет", u.web.root)
 	u.tabs = container.NewAppTabs(
 		container.NewTabItem("Журнал", u.journal.root),
 		container.NewTabItem("Ответ модели", u.stream.root),
+		u.webTab,
 		container.NewTabItem("Файлы", u.files.root),
 		container.NewTabItem("Сборка", u.build.root),
 	)
@@ -396,6 +406,7 @@ func (u *UI) loadForm() {
 		fix = 5
 	}
 	u.fixes.SetSelectedIndex(fix)
+	u.useWeb.SetChecked(c.UseWeb)
 	u.private.SetChecked(c.Private)
 	u.release.SetChecked(c.Release)
 	u.syncTargets()
@@ -410,6 +421,7 @@ func (u *UI) formToConfig() {
 	u.cfg.Targets = u.checkedTargets()
 	u.cfg.LastTask = u.prompt.Text
 	u.cfg.MaxFixes = max(u.fixes.SelectedIndex(), 0)
+	u.cfg.UseWeb = u.useWeb.Checked
 	u.cfg.Private = u.private.Checked
 	u.cfg.Release = u.release.Checked
 }
@@ -536,7 +548,7 @@ func (u *UI) setFormEnabled(on bool) {
 		Enable()
 		Disable()
 	}
-	controls := []toggler{u.repo, u.repoPick, u.branch, u.kind, u.prompt, u.fixes, u.private, u.release}
+	controls := []toggler{u.repo, u.repoPick, u.branch, u.kind, u.prompt, u.fixes, u.useWeb, u.private, u.release}
 	for _, c := range controls {
 		if on {
 			c.Enable()
@@ -601,6 +613,8 @@ func (u *UI) taskFromForm() (pipeline.Task, error) {
 		Private:     u.private.Checked,
 		Release:     u.release.Checked,
 		OutputDir:   u.cfg.OutputDir,
+		UseWeb:      u.useWeb.Checked,
+		MaxWebSteps: u.cfg.MaxWebSteps,
 		Model:       u.cfg.Model,
 		Temperature: u.cfg.Temperature,
 		MaxTokens:   u.cfg.MaxTokens,
@@ -626,6 +640,9 @@ func (u *UI) startRun(task pipeline.Task) {
 	u.started = time.Now()
 	u.journal.clear()
 	u.stream.reset()
+	u.web.set(nil)
+	u.webTab.Text = "Интернет"
+	u.tabs.Refresh()
 	u.files.set(nil)
 	u.build.clear()
 	u.hideBanner()
@@ -646,7 +663,7 @@ func (u *UI) startRun(task pipeline.Task) {
 	}
 
 	llm, gh := u.clients()
-	runner := &pipeline.Runner{LLM: llm, GH: gh, Obs: observer{u}}
+	runner := &pipeline.Runner{LLM: llm, GH: gh, Web: u.browser(u.cfg), Obs: observer{u}}
 	go func() {
 		out, err := runner.Run(ctx, task)
 		cancel()
@@ -729,6 +746,9 @@ func (u *UI) showResult(out pipeline.Outcome) {
 	var parts []string
 	if out.Attempts > 1 {
 		parts = append(parts, fmt.Sprintf("с %d-й попытки", out.Attempts))
+	}
+	if out.WebSteps > 0 {
+		parts = append(parts, fmt.Sprintf("%d %s в интернете", out.WebSteps, pluralRu(out.WebSteps, "действие", "действия", "действий")))
 	}
 	if out.Dir != "" {
 		parts = append(parts, "файлы в "+out.Dir)
@@ -816,12 +836,28 @@ func (o observer) ModelDelta(s string, reasoning bool) {
 	o.u.stream.push(streamChunk{text: s, reasoning: reasoning})
 }
 
+func (o observer) Web(steps []pipeline.WebStep) {
+	fyne.Do(func() { o.u.onWeb(steps) })
+}
+
 func (o observer) Files(files []pipeline.FileChange) {
 	fyne.Do(func() { o.u.files.set(files) })
 }
 
 func (o observer) Build(runs []pipeline.RunStatus) {
 	fyne.Do(func() { o.u.build.set(runs) })
+}
+
+func (u *UI) onWeb(steps []pipeline.WebStep) {
+	u.web.set(steps)
+	title := "Интернет"
+	if len(steps) > 0 {
+		title = fmt.Sprintf("Интернет (%d)", len(steps))
+	}
+	if u.webTab.Text != title {
+		u.webTab.Text = title
+		u.tabs.Refresh()
+	}
 }
 
 func (u *UI) onStage(stage pipeline.Stage, attempt, attempts int) {
@@ -838,7 +874,7 @@ func (u *UI) onStage(stage pipeline.Stage, attempt, attempts int) {
 	case pipeline.StageGenerate:
 		u.tabs.SelectIndex(1)
 	case pipeline.StageBuild:
-		u.tabs.SelectIndex(3)
+		u.tabs.SelectIndex(4)
 	case pipeline.StageDeliver:
 		u.tabs.SelectIndex(0)
 	}

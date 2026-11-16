@@ -17,7 +17,9 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/zigorminsk-debug/kolibri/internal/colibri"
+	"github.com/zigorminsk-debug/kolibri/internal/config"
 	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
+	"github.com/zigorminsk-debug/kolibri/internal/lightpanda"
 )
 
 const (
@@ -186,6 +188,52 @@ func (u *UI) showSettings() {
 		}, u.win)
 	})
 
+	// Lightpanda browser settings.
+	lpPath := widget.NewEntry()
+	lpPath.SetText(cfg.LightpandaPath)
+	lpPath.SetPlaceHolder("автоматически: папка приложения, PATH, WSL2 или Docker")
+	lpURL := widget.NewEntry()
+	lpURL.SetText(cfg.LightpandaURL)
+	lpURL.SetPlaceHolder("http://127.0.0.1:9222 — не обязательно (lightpanda mcp --port 9222)")
+	lpProxy := widget.NewEntry()
+	lpProxy.SetText(cfg.LightpandaProxy)
+	lpProxy.SetPlaceHolder("http://proxy:8080 — не обязательно")
+	lpRobots := widget.NewCheck("Учитывать robots.txt при открытии сайтов", nil)
+	lpRobots.SetChecked(cfg.LightpandaRobots)
+
+	searchProv := widget.NewSelect(searchProviderOptions(), nil)
+	searchProv.SetSelected(searchProviderTitle(cfg.SearchProvider))
+	searchKey := widget.NewPasswordEntry()
+	searchKey.SetText(cfg.SearchAPIKey)
+	searchKey.SetPlaceHolder("не нужен для автоматического поиска")
+
+	webSteps := widget.NewEntry()
+	webSteps.SetText(strconv.Itoa(cfg.MaxWebSteps))
+	webTimeout := widget.NewEntry()
+	webTimeout.SetText(strconv.Itoa(cfg.WebTimeoutSec))
+
+	draftBrowser := func() *lightpanda.Browser {
+		tmp := config.Config{
+			LightpandaPath:   strings.TrimSpace(lpPath.Text),
+			LightpandaURL:    strings.TrimSpace(lpURL.Text),
+			LightpandaProxy:  strings.TrimSpace(lpProxy.Text),
+			LightpandaRobots: lpRobots.Checked,
+			SearchProvider:   searchProviderID(searchProv.Selected),
+			SearchAPIKey:     strings.TrimSpace(searchKey.Text),
+			WebTimeoutSec:    cfg.WebTimeoutSec,
+		}
+		return u.browser(tmp)
+	}
+	lpStatus := newStatus()
+	var checkLP, installLP *widget.Button
+	checkLP = widget.NewButtonWithIcon("Проверить Lightpanda", theme.ConfirmIcon(), func() {
+		u.checkLightpandaInto(draftBrowser(), checkLP, lpStatus)
+	})
+	installLP = widget.NewButtonWithIcon("Установить Lightpanda", theme.DownloadIcon(), func() {
+		u.installLightpandaInto(draftBrowser(), installLP, checkLP, lpStatus, nil)
+	})
+	lpLink := widget.NewHyperlink("lightpanda-io/browser", mustURL("https://github.com/lightpanda-io/browser"))
+
 	autoUpdate := widget.NewCheck("Проверять обновления при запуске", nil)
 	autoUpdate.SetChecked(cfg.CheckUpdates)
 	updateBuilds := widget.NewCheck("Предлагать промежуточные сборки", nil)
@@ -225,6 +273,23 @@ func (u *UI) showSettings() {
 		three,
 		hint("0 токенов — без ограничения: ответ может занять весь контекст модели. Колибри шлёт сигнал каждые 10 секунд; если сервер молчит дольше указанного, запрос обрывается."),
 
+		sectionTitle("Браузер Lightpanda"),
+		hint("Когда Колибри нужны сведения об устройстве программы, протокола или библиотеки, Kolibri Forge выполняет её запросы в браузере Lightpanda (AGPL-3.0, запускается отдельным процессом с отключённой телеметрией) и возвращает найденное модели."),
+		container.NewHBox(checkLP, installLP, lpLink),
+		lpStatus.label,
+		row("Путь к исполняемому файлу", lpPath),
+		row("Адрес MCP-сервера Lightpanda", lpURL),
+		container.NewGridWithColumns(2,
+			row("Поисковая система", searchProv),
+			row("API-ключ поиска", searchKey),
+		),
+		container.NewGridWithColumns(2,
+			row("Макс. шагов в интернете", webSteps),
+			row("Таймаут шага, сек", webTimeout),
+		),
+		row("HTTP-прокси для браузера", lpProxy),
+		lpRobots,
+
 		sectionTitle("Готовые сборки"),
 		row("Папка, куда скачивать программы", container.NewBorder(nil, nil, nil, pick, outDir)),
 
@@ -238,7 +303,7 @@ func (u *UI) showSettings() {
 		gap(0, 4),
 	)
 
-	for _, st := range []*status{llmStatus, ghStatus, updateStatus, problem} {
+	for _, st := range []*status{llmStatus, ghStatus, lpStatus, updateStatus, problem} {
 		st.after = form.Refresh
 	}
 
@@ -273,6 +338,36 @@ func (u *UI) showSettings() {
 			return
 		}
 		next.IdleTimeoutMin = m
+		ws, err := strconv.Atoi(strings.TrimSpace(webSteps.Text))
+		if err != nil || ws < 1 || ws > 20 {
+			problem.set("Макс. шагов в интернете — целое число от 1 до 20.", widget.DangerImportance)
+			return
+		}
+		next.MaxWebSteps = ws
+		wt, err := strconv.Atoi(strings.TrimSpace(webTimeout.Text))
+		if err != nil || wt < 5 || wt > 180 {
+			problem.set("Таймаут шага в интернете — целое число секунд от 5 до 180.", widget.DangerImportance)
+			return
+		}
+		next.WebTimeoutSec = wt
+		next.LightpandaPath = strings.TrimSpace(lpPath.Text)
+		next.LightpandaURL = strings.TrimSpace(lpURL.Text)
+		if next.LightpandaURL != "" {
+			if _, err := lightpanda.NormalizeMCPURL(next.LightpandaURL); err != nil {
+				problem.set(capitalize(err.Error()), widget.DangerImportance)
+				return
+			}
+		}
+		next.LightpandaProxy = strings.TrimSpace(lpProxy.Text)
+		if next.LightpandaProxy != "" {
+			if p, err := url.Parse(next.LightpandaProxy); err != nil || p.Host == "" || (p.Scheme != "http" && p.Scheme != "https") {
+				problem.set("HTTP-прокси должен выглядеть как http://proxy:8080.", widget.DangerImportance)
+				return
+			}
+		}
+		next.LightpandaRobots = lpRobots.Checked
+		next.SearchProvider = searchProviderID(searchProv.Selected)
+		next.SearchAPIKey = strings.TrimSpace(searchKey.Text)
 		next.GitHubToken = strings.TrimSpace(token.Text)
 		next.GitHubClientID = strings.TrimSpace(clientID.Text)
 		next.CheckUpdates, next.UpdateBuilds = autoUpdate.Checked, updateBuilds.Checked
@@ -282,7 +377,7 @@ func (u *UI) showSettings() {
 
 		u.formToConfig()
 		next.Repo, next.Branch, next.ProjectKind, next.Targets = u.cfg.Repo, u.cfg.Branch, u.cfg.ProjectKind, u.cfg.Targets
-		next.LastTask, next.MaxFixes, next.Private, next.Release = u.cfg.LastTask, u.cfg.MaxFixes, u.cfg.Private, u.cfg.Release
+		next.LastTask, next.MaxFixes, next.UseWeb, next.Private, next.Release = u.cfg.LastTask, u.cfg.MaxFixes, u.cfg.UseWeb, u.cfg.Private, u.cfg.Release
 		if err := u.Save(next); err != nil {
 			problem.set(capitalize(err.Error()), widget.DangerImportance)
 			return

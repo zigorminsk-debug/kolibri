@@ -191,7 +191,7 @@ type streamChunk struct {
 	title     bool
 }
 
-var blockMarker = regexp.MustCompile(`^\s*={2,}\s*(FILE|DELETE|END)\b`)
+var blockMarker = regexp.MustCompile(`^\s*={2,}\s*(FILE|DELETE|WEB|BROWSER|LIGHTPANDA|SEARCH|OPEN|BROWSE|GOTO|NOTES?|NEXT|END)\b`)
 
 // streamView shows the model's reply as it is generated. Tokens arrive far
 // faster than a window should repaint, so they are buffered and drawn in

@@ -3,6 +3,7 @@ package pipeline
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -12,8 +13,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zigorminsk-debug/kolibri/internal/colibri"
+	"github.com/zigorminsk-debug/kolibri/internal/lightpanda"
 )
 
 // ---- fake colibri -------------------------------------------------------
@@ -538,6 +541,7 @@ type recorder struct {
 	logs   []string
 	model  strings.Builder
 	think  strings.Builder
+	web    []WebStep
 	files  [][]FileChange
 	builds int
 	onLog  func(string)
@@ -571,6 +575,12 @@ func (r *recorder) ModelDelta(text string, reasoning bool) {
 	}
 }
 
+func (r *recorder) Web(steps []WebStep) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.web = append([]WebStep(nil), steps...)
+}
+
 func (r *recorder) Files(files []FileChange) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -596,4 +606,58 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// ---- fake lightpanda ----------------------------------------------------
+
+type fakeWeb struct {
+	mu      sync.Mutex
+	opens   int
+	closes  int
+	actions []lightpanda.Action
+	openErr error
+	do      func(n int, a lightpanda.Action) lightpanda.Result
+}
+
+func (f *fakeWeb) Check(context.Context) (lightpanda.Status, error) {
+	if f.openErr != nil {
+		return lightpanda.Status{}, f.openErr
+	}
+	return lightpanda.Status{Mode: lightpanda.ModeLocal, Version: "1.0.4", Location: "fake"}, nil
+}
+
+func (f *fakeWeb) Open(context.Context) (lightpanda.Session, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opens++
+	if f.openErr != nil {
+		return nil, f.openErr
+	}
+	return &fakeWebSess{f: f}, nil
+}
+
+type fakeWebSess struct{ f *fakeWeb }
+
+func (s *fakeWebSess) Do(_ context.Context, a lightpanda.Action) lightpanda.Result {
+	s.f.mu.Lock()
+	n := len(s.f.actions)
+	s.f.actions = append(s.f.actions, a)
+	fn := s.f.do
+	s.f.mu.Unlock()
+	if fn != nil {
+		r := fn(n, a)
+		r.Action = a
+		if r.Duration == 0 {
+			r.Duration = 15 * time.Millisecond
+		}
+		return r
+	}
+	return lightpanda.Result{Action: a, Content: "ok", Duration: 10 * time.Millisecond}
+}
+
+func (s *fakeWebSess) Close() error {
+	s.f.mu.Lock()
+	defer s.f.mu.Unlock()
+	s.f.closes++
+	return nil
 }

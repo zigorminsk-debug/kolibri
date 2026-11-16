@@ -98,3 +98,18 @@ func TestLogDoesNotGrowForever(t *testing.T) {
 		t.Error("a trimmed log keeps its header and says it was trimmed")
 	}
 }
+
+func TestAppendWebSummary(t *testing.T) {
+	doc := Append("", Entry{
+		Time:    time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC),
+		Kind:    "Задача",
+		Task:    "Сделай аналог Radmin VPN",
+		Web:     []string{"поиск «radmin vpn»", "www.radmin-vpn.com"},
+		Files:   []string{"+ main.go"},
+		Summary: "Локальная mesh-сеть",
+	})
+	want := "- **Интернет (Lightpanda):** поиск «radmin vpn»; www.radmin-vpn.com"
+	if !strings.Contains(doc, want) {
+		t.Fatalf("log missing %q:\n%s", want, doc)
+	}
+}

@@ -174,6 +174,17 @@ type promptExtra struct {
 	history string
 	// resume tells the model that it continues a reply that was cut short.
 	resume string
+	// web holds Lightpanda search and page findings gathered so far.
+	web string
+	// useWeb includes Lightpanda browser instructions in the system prompt.
+	useWeb bool
+}
+
+func systemPromptFor(useWeb bool) string {
+	if useWeb {
+		return systemPrompt + webPrompt
+	}
+	return systemPrompt
 }
 
 func (e promptExtra) write(b *strings.Builder) {
@@ -184,6 +195,10 @@ func (e promptExtra) write(b *strings.Builder) {
 	if e.history != "" {
 		b.WriteString("\n\nWork log of this project, oldest entry first. The pipeline keeps it; the newest entry is the last step taken:\n\n")
 		b.WriteString(e.history)
+	}
+	if e.web != "" {
+		b.WriteString("\n\n")
+		b.WriteString(e.web)
 	}
 }
 
@@ -198,7 +213,7 @@ func taskMessages(task Task, kind workflow.Kind, project map[string]string, othe
 	fmt.Fprintf(&b, "\n\nRepository: %s/%s\n", task.Owner, task.Repo)
 	projectSection(&b, project, otherPaths, budget, nil)
 	return []colibri.Message{
-		{Role: "system", Content: systemPrompt},
+		{Role: "system", Content: systemPromptFor(extra.useWeb)},
 		{Role: "user", Content: strings.TrimRight(b.String(), "\n")},
 	}
 }
@@ -229,7 +244,7 @@ func fixMessages(task Task, kind workflow.Kind, project map[string]string, other
 	b.WriteString("\n\n")
 	projectSection(&b, project, otherPaths, budget, first)
 	return []colibri.Message{
-		{Role: "system", Content: systemPrompt},
+		{Role: "system", Content: systemPromptFor(extra.useWeb)},
 		{Role: "user", Content: strings.TrimRight(b.String(), "\n")},
 	}
 }

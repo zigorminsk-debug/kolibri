@@ -43,6 +43,14 @@ jobs:
         run: go vet -tags ci ./...
       - name: Test
         run: go test -race -tags ci ./...
+      - name: Test with Lightpanda
+        run: |
+          lp="$RUNNER_TEMP/lightpanda"
+          curl -fsSL --retry 3 -o "$lp" \
+            https://github.com/lightpanda-io/browser/releases/download/1.0.4/lightpanda-x86_64-linux
+          chmod +x "$lp"
+          "$lp" version
+          LIGHTPANDA_TEST_BIN="$lp" go test -race -v -run 'TestRealLightpanda|TestRunWithRealLightpanda' ./internal/lightpanda ./internal/pipeline
 
   build:
     name: Build (${{ matrix.target }})

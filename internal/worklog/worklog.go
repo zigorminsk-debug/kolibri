@@ -46,6 +46,9 @@ type Entry struct {
 	Model string
 	// Summary is the model's one-line description of what it did.
 	Summary string
+	// Web lists brief descriptions of searches and pages read through
+	// Lightpanda while carrying out this step.
+	Web []string
 	// Files lists the changes, like "+ main.go", "~ go.mod", "- old.txt".
 	Files []string
 	// Unfinished says why the step is incomplete, empty when it is whole.
@@ -75,6 +78,20 @@ func Append(doc string, e Entry) string {
 	}
 	if e.Summary != "" {
 		fmt.Fprintf(&b, "- **Сделано:** %s\n", oneLine(e.Summary, 300))
+	}
+	if len(e.Web) > 0 {
+		const maxListed = 15
+		items := e.Web
+		more := ""
+		if len(items) > maxListed {
+			more = fmt.Sprintf(" и ещё %d", len(items)-maxListed)
+			items = items[:maxListed]
+		}
+		cleaned := make([]string, len(items))
+		for i, w := range items {
+			cleaned[i] = oneLine(w, 120)
+		}
+		fmt.Fprintf(&b, "- **Интернет (Lightpanda):** %s%s\n", strings.Join(cleaned, "; "), more)
 	}
 	if len(e.Files) > 0 {
 		const maxListed = 40

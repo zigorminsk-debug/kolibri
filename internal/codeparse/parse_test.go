@@ -203,3 +203,95 @@ func TestParseNextBlock(t *testing.T) {
 		t.Errorf("marker inside a file: %+v", res)
 	}
 }
+
+func TestParseWebBlockFormats(t *testing.T) {
+	// 1. Canonical JSONL with === NOTES ===, returning ErrNoFiles while populating Web and Notes.
+	reply := "<think>should avoid === SEARCH: secret === here</think>\n" +
+		"=== NOTES ===\nИзучаю устройство Radmin VPN и протокол туннеля.\n=== END NOTES ===\n\n" +
+		"=== WEB ===\n" +
+		`{"action":"search","query":"radmin vpn architecture","limit":5}` + "\n" +
+		`{"action":"open","url":"https://www.radmin-vpn.com/"}` + "\n" +
+		`{"action":"extract","selector":".feature","schema":{"title":"string"}}` + "\n" +
+		`{"action":"click","node_id":7}` + "\n" +
+		`{"action":"fill","selector":"input[name=q]","value":"mesh","submit":true}` + "\n" +
+		"=== END WEB ===\n"
+	res, err := Parse(reply, false)
+	if !errors.Is(err, ErrNoFiles) {
+		t.Fatalf("err = %v, want ErrNoFiles", err)
+	}
+	if res.Notes != "Изучаю устройство Radmin VPN и протокол туннеля." {
+		t.Errorf("Notes = %q", res.Notes)
+	}
+	if len(res.Web) != 5 {
+		t.Fatalf("len(Web) = %d: %+v", len(res.Web), res.Web)
+	}
+	if res.Web[0].Kind != "search" || res.Web[0].Query != "radmin vpn architecture" || res.Web[0].Limit != 5 {
+		t.Errorf("Web[0] = %+v", res.Web[0])
+	}
+	if res.Web[1].Kind != "open" || res.Web[1].URL != "https://www.radmin-vpn.com/" {
+		t.Errorf("Web[1] = %+v", res.Web[1])
+	}
+	if res.Web[2].Kind != "extract" || res.Web[2].Schema != `{"title":"string"}` {
+		t.Errorf("Web[2] = %+v", res.Web[2])
+	}
+	if res.Web[3].Kind != "click" || res.Web[3].NodeID != 7 {
+		t.Errorf("Web[3] = %+v", res.Web[3])
+	}
+	if res.Web[4].Kind != "fill" || res.Web[4].Value != "mesh" || !res.Web[4].Submit {
+		t.Errorf("Web[4] = %+v", res.Web[4])
+	}
+
+	// 2. Fenced multi-line JSON array, field aliases, MCP-style arguments, and direction helper.
+	drifted := "=== WEB ===\n```json\n[\n" +
+		`  {"tool":"goto","arguments":{"href":"https://wireguard.com/protocol/"}},` + "\n" +
+		`  {"type":"scroll","direction":"down"},` + "\n" +
+		`  {"q":"golang tun tap windows wintun"}` + "\n" +
+		"]\n```\n=== END WEB ===\n"
+	res, err = Parse(drifted, false)
+	if !errors.Is(err, ErrNoFiles) || len(res.Web) != 3 {
+		t.Fatalf("drifted: err=%v web=%+v", err, res.Web)
+	}
+	if res.Web[0].Kind != "open" || res.Web[0].URL != "https://wireguard.com/protocol/" {
+		t.Errorf("drifted[0] = %+v", res.Web[0])
+	}
+	if res.Web[1].Kind != "scroll" || res.Web[1].Y <= 0 {
+		t.Errorf("drifted[1] = %+v", res.Web[1])
+	}
+	if res.Web[2].Kind != "search" || res.Web[2].Query != "golang tun tap windows wintun" {
+		t.Errorf("drifted[2] = %+v", res.Web[2])
+	}
+
+	// 3. Plain-text shorthand and single-line markers.
+	short := "=== SEARCH: radmin vpn nat traversal ===\n=== OPEN: https://example.com/spec ===\n" +
+		"=== WEB ===\n- поиск: udp hole punching go\n- links\n- click: #12\n=== END WEB ===\n"
+	res, _ = Parse(short, false)
+	if len(res.Web) != 5 || res.Web[0].Query != "radmin vpn nat traversal" || res.Web[1].URL != "https://example.com/spec" ||
+		res.Web[2].Query != "udp hole punching go" || res.Web[3].Kind != "links" || res.Web[4].NodeID != 12 {
+		t.Fatalf("shorthand web = %+v", res.Web)
+	}
+
+	// 4. Mixed turn: model writes files AND requests another web lookup before finishing.
+	mixed := "SUMMARY: Базовый каркас VPN\n\n=== FILE: go.mod ===\nmodule localvpn\n\ngo 1.24\n=== END FILE ===\n\n" +
+		"=== WEB ===\n" + `{"action":"search","query":"water tun library windows api"}` + "\n=== END WEB ===\n"
+	res, err = Parse(mixed, false)
+	if err != nil {
+		t.Fatalf("mixed err = %v", err)
+	}
+	if len(res.Files) != 1 || res.Files[0].Path != "go.mod" || len(res.Web) != 1 || res.Web[0].Kind != "search" {
+		t.Fatalf("mixed = %+v", res)
+	}
+
+	// 5. Cut-off inside a second JSON line preserves the first complete action.
+	cut := "=== WEB ===\n" + `{"action":"search","query":"first"}` + "\n" + `{"action":"open","url":"https://exa`
+	res, _ = Parse(cut, true)
+	if len(res.Web) != 1 || res.Web[0].Query != "first" {
+		t.Fatalf("cut web = %+v", res.Web)
+	}
+
+	// 6. === WEB === and === END WEB === inside a file block stay file content.
+	doc := "=== WEB ===\n{\"action\":\"search\",\"query\":\"demo\"}\n=== END WEB ===\n"
+	res, err = Parse("=== FILE: docs/protocol.md ===\n"+doc+"=== END FILE ===\n", false)
+	if err != nil || len(res.Web) != 0 || res.Files[0].Content != doc {
+		t.Fatalf("web inside file: err=%v web=%+v files=%+v", err, res.Web, res.Files)
+	}
+}

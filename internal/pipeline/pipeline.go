@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/zigorminsk-debug/kolibri/internal/codeparse"
 	"github.com/zigorminsk-debug/kolibri/internal/colibri"
 	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
+	"github.com/zigorminsk-debug/kolibri/internal/lightpanda"
 	"github.com/zigorminsk-debug/kolibri/internal/workflow"
 	"github.com/zigorminsk-debug/kolibri/internal/worklog"
 )
@@ -64,6 +66,8 @@ type Observer interface {
 	// ModelStart marks the beginning of a new reply from the model.
 	ModelStart(title string)
 	ModelDelta(text string, reasoning bool)
+	// Web reports the browser steps carried out through Lightpanda so far.
+	Web(steps []WebStep)
 	// Files reports what the current attempt changes.
 	Files(files []FileChange)
 	// Build reports the state of the GitHub Actions runs.
@@ -88,6 +92,12 @@ type Task struct {
 	// OutputDir is where artifacts are unpacked; "" skips the download.
 	OutputDir string
 
+	// UseWeb allows the model to ask Kolibri Forge to run internet searches
+	// and browse pages through Lightpanda while solving the task.
+	UseWeb bool
+	// MaxWebSteps bounds how many === WEB === rounds one generation may run.
+	MaxWebSteps int
+
 	Model       string
 	Temperature float64
 	MaxTokens   int
@@ -107,6 +117,8 @@ type Outcome struct {
 	Artifacts []string
 	// Attempts is how many generations it took.
 	Attempts int
+	// WebSteps is how many Lightpanda browser actions ran during the task.
+	WebSteps int
 	Kind     workflow.Kind
 	// Next is the model's note on what is left to do, "" when it considers
 	// the task finished.
@@ -147,6 +159,9 @@ func (e *BuildFailedError) Error() string {
 type Runner struct {
 	LLM *colibri.Client
 	GH  *ghapi.Client
+	// Web, when non-nil and enabled on the Task, lets the model request
+	// internet searches and page actions through Lightpanda.
+	Web lightpanda.Driver
 	Obs Observer
 
 	// PollInterval is the pause between build status checks (default 6s).
@@ -210,6 +225,14 @@ type state struct {
 	androidWarned bool
 	// lastError is the most telling line of the latest build failure.
 	lastError string
+
+	// Lightpanda browser session and findings accumulated during this run.
+	webSess  lightpanda.Session
+	webOff   string // reason Lightpanda was turned off mid-run, "" while usable
+	webSteps []WebStep
+	webCache map[string]int
+	webNotes []string // compact action labels awaiting the next worklog entry
+	research string   // compact summary kept across cut-off continuations
 }
 
 // maxParts bounds how many replies in a row one generation may take when
@@ -244,7 +267,12 @@ func (r *Runner) Run(ctx context.Context, task Task) (out Outcome, err error) {
 	if task.MaxFixes < 0 {
 		task.MaxFixes = 0
 	}
-	st := &state{task: task, modes: map[string]string{}, project: map[string]string{}, opaque: map[string]bool{}}
+	st := &state{
+		task: task, modes: map[string]string{}, project: map[string]string{},
+		opaque: map[string]bool{}, webCache: map[string]int{},
+	}
+	defer st.closeWeb()
+	defer func() { out.WebSteps = len(st.webSteps) }()
 	total := 1 + task.MaxFixes
 
 	r.Obs.Stage(StagePrepare, 1, total)
@@ -657,50 +685,210 @@ func (r *Runner) generate(ctx context.Context, st *state, failure, resume string
 	// The log gets a small, fixed share of the context: enough for the
 	// latest steps and the plan.
 	history := worklog.Tail(st.worklog, logShare(st.ctxLen))
-	fixed := len(systemPrompt) + len(task.Prompt) + len(failure) + len(history) + len(resume) + 1500
-	budget := fileBudget(st.ctxLen, task.MaxTokens, fixed)
+	if failure == "" {
+		st.summary = ""
+	}
+
+	// Track all file edits made across multiple === WEB === rounds against
+	// the state at the start of this generation.
+	baseProject := maps.Clone(st.project)
+	baseOpaque := maps.Clone(st.opaque)
+	var touchOrder []string
+	touched := map[string]bool{}
+
+	applyFiles := func(files []codeparse.File) {
+		for _, f := range files {
+			if strings.HasPrefix(f.Path, ".github/") || strings.HasPrefix(f.Path, worklog.Dir) {
+				r.logf(Warn, "Модель прислала %s — файлы в .github/ и .kolibri/ ведёт приложение, пропускаю", f.Path)
+				continue
+			}
+			if !touched[f.Path] {
+				touched[f.Path] = true
+				touchOrder = append(touchOrder, f.Path)
+			}
+			if f.Delete {
+				delete(st.project, f.Path)
+				delete(st.opaque, f.Path)
+				continue
+			}
+			st.project[f.Path] = f.Content
+			delete(st.opaque, f.Path)
+		}
+	}
+
+	diffChanges := func() (changes []ghapi.Change, view []FileChange, staged []string) {
+		for _, p := range touchOrder {
+			old, wasText := baseProject[p]
+			existed := wasText || baseOpaque[p]
+			cur, hasNow := st.project[p]
+			if !hasNow {
+				if !existed {
+					continue
+				}
+				changes = append(changes, ghapi.Change{Path: p, Delete: true, Mode: st.modes[p]})
+				view = append(view, FileChange{Path: p, Status: "deleted"})
+				continue
+			}
+			if wasText && old == cur && !baseOpaque[p] {
+				continue // the model repeated a file without changing it
+			}
+			status := "new"
+			if existed {
+				status = "changed"
+			}
+			changes = append(changes, ghapi.Change{Path: p, Content: []byte(cur), Mode: fileMode(st.modes[p], cur)})
+			view = append(view, FileChange{Path: p, Content: cur, Status: status})
+			staged = append(staged, p)
+		}
+		sort.Strings(staged)
+		return changes, view, staged
+	}
+
+	maxRounds := st.maxWebRounds()
+	var rounds []webRound
+	nudgedStopWeb := false
 
 	var reply string
 	var cutOff bool
 	var broken error
-	for shrink := 0; ; shrink++ {
-		var messages []colibri.Message
-		title := "Задача"
-		extra := promptExtra{history: history, resume: resume}
-		if failure == "" {
-			messages = taskMessages(task, kind, st.project, st.opaquePaths(), budget, extra)
-		} else {
-			title = fmt.Sprintf("Исправление сборки (попытка %d)", st.attempts)
-			messages = fixMessages(task, kind, st.project, st.opaquePaths(), budget, failure, extra)
-		}
-		if resume != "" {
-			title += " — продолжение"
-		}
-		r.Obs.ModelStart(title)
-		r.logf(Info, "Отправляю запрос модели %s (%s)", st.model, sizeText(messagesLen(messages)))
+	var parsed codeparse.Result
+	var perr error
+	var lastWebCtx string
 
-		var err error
-		reply, cutOff, broken, err = r.ask(ctx, st, messages)
-		if err == nil {
+	for {
+		allowWeb := r.webAllowed(st) && len(rounds) < maxRounds && !nudgedStopWeb
+		wBudget := webBudget(st.ctxLen, task.MaxTokens)
+		_, _, staged := diffChanges()
+
+		makeWeb := func(wb int) string {
+			if len(rounds) > 0 {
+				s := renderWebContext(rounds, st.webSteps, wb, maxRounds, staged, allowWeb)
+				if nudgedStopWeb {
+					s += "\n\n" + finishAfterWebRequest
+				}
+				return s
+			}
+			if st.research != "" && wb > 0 {
+				return clip(st.research, min(wb, logShare(st.ctxLen)))
+			}
+			return ""
+		}
+
+		lastWebCtx = makeWeb(wBudget)
+		sys := systemPromptFor(allowWeb)
+		fixed := len(sys) + len(task.Prompt) + len(failure) + len(history) + len(resume) + len(lastWebCtx) + 1500
+		fBudget := fileBudget(st.ctxLen, task.MaxTokens, fixed)
+
+		var askErr error
+		for shrink := 0; ; shrink++ {
+			title := "Задача"
+			if failure != "" {
+				title = fmt.Sprintf("Исправление сборки (попытка %d)", st.attempts)
+			}
+			if resume != "" {
+				title += " — продолжение"
+			}
+			if len(rounds) > 0 {
+				title += fmt.Sprintf(" — после поиска %d", len(rounds))
+			}
+			extra := promptExtra{history: history, resume: resume, web: lastWebCtx, useWeb: allowWeb}
+			var messages []colibri.Message
+			if failure == "" {
+				messages = taskMessages(task, kind, st.project, st.opaquePaths(), fBudget, extra)
+			} else {
+				messages = fixMessages(task, kind, st.project, st.opaquePaths(), fBudget, failure, extra)
+			}
+			r.Obs.ModelStart(title)
+			r.logf(Info, "Отправляю запрос модели %s (%s)", st.model, sizeText(messagesLen(messages)))
+
+			reply, cutOff, broken, askErr = r.ask(ctx, st, messages)
+			if askErr == nil {
+				break
+			}
+			if colibri.ContextExceeded(askErr) && shrink < 3 && (fBudget > 0 || (len(lastWebCtx) > 2500)) {
+				fBudget /= 2
+				if shrink >= 1 {
+					fBudget = 0
+				}
+				if wBudget > 3000 {
+					wBudget /= 2
+					lastWebCtx = makeWeb(wBudget)
+				}
+				r.logf(Warn, "Запрос не поместился в контекст модели — сокращаю контекст и повторяю")
+				continue
+			}
 			break
 		}
-		if colibri.ContextExceeded(err) && shrink < 2 && budget > 0 {
-			budget /= 2
-			if shrink == 1 {
-				budget = 0
+		if askErr != nil {
+			// If earlier mixed rounds already wrote complete files and the
+			// stream dropped on a later round, keep those files instead of
+			// throwing the user's progress away.
+			if changes, _, _ := diffChanges(); len(changes) > 0 && ctx.Err() == nil && !colibri.ContextExceeded(askErr) {
+				r.logf(Warn, "Ответ модели прервался (%v), но файлы с предыдущих шагов готовы", askErr)
+				cutOff, broken, parsed, perr = true, askErr, codeparse.Result{}, nil
+				break
 			}
-			r.logf(Warn, "Запрос не поместился в контекст модели — сокращаю исходники и повторяю")
-			continue
+			return none, askErr
 		}
-		return none, err
+
+		parsed, perr = codeparse.Parse(reply, cutOff)
+		for _, p := range parsed.Rejected {
+			r.logf(Warn, "Пропущен недопустимый путь из ответа: %s", clip(p, 80))
+		}
+		if parsed.Summary != "" {
+			st.summary = parsed.Summary
+		}
+		applyFiles(parsed.Files)
+
+		// Execute Lightpanda actions when the model asked for internet help.
+		if len(parsed.Web) > 0 && broken == nil && ctx.Err() == nil {
+			if r.webAllowed(st) && len(rounds) < maxRounds {
+				if _, view, _ := diffChanges(); len(view) > 0 {
+					sort.SliceStable(view, func(i, j int) bool { return view[i].Path < view[j].Path })
+					r.Obs.Files(view)
+					r.logf(Info, "Промежуточно подготовлено %d %s — продолжаю поиск в интернете",
+						len(view), plural(len(view), "файл", "файла", "файлов"))
+				}
+				rd, werr := r.runWebRound(ctx, st, len(rounds)+1, parsed.Notes, parsed.Web)
+				if werr != nil {
+					return none, werr
+				}
+				if parsed.Truncated && parsed.TruncatedPath != "" {
+					note := "File " + parsed.TruncatedPath + " was cut off and not saved; send it in full when you write the code."
+					if rd.notice != "" {
+						rd.notice += "\n" + note
+					} else {
+						rd.notice = note
+					}
+				}
+				rounds = append(rounds, rd)
+				continue
+			}
+			if r.Web != nil && task.UseWeb && !nudgedStopWeb {
+				nudgedStopWeb = true
+				if len(rounds) >= maxRounds {
+					r.logf(Warn, "Достигнут лимит шагов в интернете (%d) — прошу модель завершить код по собранным данным", maxRounds)
+				}
+				continue
+			}
+		}
+		break
 	}
 
-	parsed, perr := codeparse.Parse(reply, cutOff)
-	if errors.Is(perr, codeparse.ErrNoFiles) && !parsed.Truncated && broken == nil && ctx.Err() == nil {
+	if len(rounds) > 0 {
+		st.research = summarizeResearch(rounds, st.webSteps, logShare(st.ctxLen))
+	}
+
+	changes, view, _ := diffChanges()
+	if len(changes) == 0 && errors.Is(perr, codeparse.ErrNoFiles) && !parsed.Truncated && broken == nil && ctx.Err() == nil {
 		r.logf(Warn, "В ответе нет файлов в нужном формате — прошу модель оформить ответ заново")
+		userPrompt := "Task:\n" + strings.TrimSpace(task.Prompt) + "\n\n" + buildRules(kind, task.Targets)
+		if lastWebCtx != "" {
+			userPrompt += "\n\n" + clip(lastWebCtx, 12_000)
+		}
 		messages := []colibri.Message{
 			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: "Task:\n" + strings.TrimSpace(task.Prompt) + "\n\n" + buildRules(kind, task.Targets)},
+			{Role: "user", Content: userPrompt},
 		}
 		if prev := strings.TrimSpace(clip(reply, 6000)); prev != "" {
 			messages = append(messages, colibri.Message{Role: "assistant", Content: prev})
@@ -713,8 +901,16 @@ func (r *Runner) generate(ctx context.Context, st *state, failure, resume string
 			return none, err
 		}
 		parsed, perr = codeparse.Parse(reply, cutOff)
+		for _, p := range parsed.Rejected {
+			r.logf(Warn, "Пропущен недопустимый путь из ответа: %s", clip(p, 80))
+		}
+		if parsed.Summary != "" {
+			st.summary = parsed.Summary
+		}
+		applyFiles(parsed.Files)
+		changes, view, _ = diffChanges()
 	}
-	if perr != nil {
+	if perr != nil && len(changes) == 0 {
 		if broken != nil {
 			// Nothing whole arrived before the stream broke.
 			return none, broken
@@ -739,47 +935,6 @@ func (r *Runner) generate(ctx context.Context, st *state, failure, resume string
 			gen.resume = "Your previous reply was cut off before it ended. Every file completed in it is committed and shown below. " +
 				"Do not repeat finished files: send only what is still missing."
 		}
-	}
-	for _, p := range parsed.Rejected {
-		r.logf(Warn, "Пропущен недопустимый путь из ответа: %s", clip(p, 80))
-	}
-	if parsed.Summary != "" {
-		st.summary = parsed.Summary
-	} else if failure == "" {
-		st.summary = ""
-	}
-
-	// Apply the reply to the in-memory project.
-	var changes []ghapi.Change
-	var view []FileChange
-	for _, f := range parsed.Files {
-		if strings.HasPrefix(f.Path, ".github/") || strings.HasPrefix(f.Path, worklog.Dir) {
-			r.logf(Warn, "Модель прислала %s — файлы в .github/ и .kolibri/ ведёт приложение, пропускаю", f.Path)
-			continue
-		}
-		old, existed := st.project[f.Path]
-		existed = existed || st.opaque[f.Path]
-		if f.Delete {
-			if !existed {
-				continue
-			}
-			delete(st.project, f.Path)
-			delete(st.opaque, f.Path)
-			changes = append(changes, ghapi.Change{Path: f.Path, Delete: true, Mode: st.modes[f.Path]})
-			view = append(view, FileChange{Path: f.Path, Status: "deleted"})
-			continue
-		}
-		if existed && old == f.Content && !st.opaque[f.Path] {
-			continue // the model repeated a file without changing it
-		}
-		status := "new"
-		if existed {
-			status = "changed"
-		}
-		st.project[f.Path] = f.Content
-		delete(st.opaque, f.Path)
-		changes = append(changes, ghapi.Change{Path: f.Path, Content: []byte(f.Content), Mode: fileMode(st.modes[f.Path], f.Content)})
-		view = append(view, FileChange{Path: f.Path, Content: f.Content, Status: status})
 	}
 	switch {
 	case len(changes) > 0:
@@ -968,7 +1123,7 @@ func (r *Runner) commit(ctx context.Context, st *state, gen generation, kind com
 
 	entry := worklog.Entry{
 		Time: time.Now(), Kind: "Задача", Model: st.model,
-		Summary: st.summary, Files: gen.files, Unfinished: gen.partial, Next: st.next,
+		Summary: st.summary, Web: st.webNotes, Files: gen.files, Unfinished: gen.partial, Next: st.next,
 	}
 	if !st.logged {
 		// The task is written once per run; later entries belong to it.
@@ -994,6 +1149,7 @@ func (r *Runner) commit(ctx context.Context, st *state, gen generation, kind com
 	}
 	st.head = head
 	st.worklog, st.logged = doc, true
+	st.webNotes = nil
 	st.pending = kind.partial
 	for _, ch := range changes {
 		if ch.Delete {
