@@ -564,6 +564,8 @@ func bannerText(u *UI) string {
 }
 
 func TestWebResearchViewAndSettings(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
 	u, win := newTestUI(t, demoConfig(), 1240, 800)
 	if !u.useWeb.Checked {
 		t.Fatal("web search must be enabled by default")
@@ -650,6 +652,7 @@ func TestWebResearchViewAndSettings(t *testing.T) {
 	}
 	mcpEntry.SetText("http://127.0.0.1:9222")
 	test.Tap(findButton(t, u, "Сохранить"))
+	u.bg.Wait()
 	if saved.LightpandaURL != "http://127.0.0.1:9222/mcp" && saved.LightpandaURL != "http://127.0.0.1:9222" {
 		t.Errorf("saved LightpandaURL = %q", saved.LightpandaURL)
 	}

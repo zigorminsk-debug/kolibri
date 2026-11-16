@@ -290,6 +290,7 @@ func (u *UI) formPanel() fyne.CanvasObject {
 
 	u.prompt = widget.NewMultiLineEntry()
 	u.prompt.Wrapping = fyne.TextWrapWord
+	u.prompt.SetMinRowsVisible(2)
 	u.prompt.SetPlaceHolder("Например: посмотри как устроена программа Radmin VPN и сделай аналогичную для локального использования")
 	u.prompt.OnChanged = func(string) { u.clearProblem() }
 
@@ -323,11 +324,9 @@ func (u *UI) formPanel() fyne.CanvasObject {
 	)
 	checks := container.NewThemeOverride(container.NewVBox(u.useWeb, u.private, u.release), denseTheme{})
 	u.formFoot = container.NewVBox(
-		gap(0, 2),
 		container.NewBorder(nil, nil, container.NewCenter(text("Чинить упавшую сборку", 13.5, colText, fyne.TextStyle{})), fixed(130, u.fixes.MinSize().Height, u.fixes)),
 		checks,
 		u.problem,
-		gap(0, 2),
 		u.runBtn,
 	)
 	u.formBody = container.NewBorder(u.formTop, u.formFoot, nil, nil, u.prompt)
