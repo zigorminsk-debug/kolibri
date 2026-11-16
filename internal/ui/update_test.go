@@ -235,7 +235,7 @@ func TestHelpSections(t *testing.T) {
 		}
 	}
 	// Sections the help refers to by name must exist.
-	for _, title := range []string{"Типы проектов", "Системы и Android", "Поиск в интернете и Lightpanda", "Обновление программы", "Готовые программы и релизы"} {
+	for _, title := range []string{"Типы проектов", "Системы и Android", "Поиск в интернете и Lightpanda", "Чтение скриншотов ошибок", "Обновление программы", "Готовые программы и релизы"} {
 		if !seen[title] {
 			t.Errorf("no section %q", title)
 		}
@@ -250,7 +250,7 @@ func TestHelpSections(t *testing.T) {
 			t.Errorf("the help does not describe the project kind %q", k.Title)
 		}
 	}
-	for _, label := range []string{u.useWeb.Text, u.private.Text, u.release.Text, "Чинить упавшую сборку", "Проверить Lightpanda", "Установить Lightpanda", "Проверять обновления при запуске", "Предлагать промежуточные сборки", "Проверить обновления"} {
+	for _, label := range []string{u.shotPick.Text, u.shotPaste.Text, u.useWeb.Text, u.private.Text, u.release.Text, "Чинить упавшую сборку", "Проверить Lightpanda", "Установить Lightpanda", "Проверять обновления при запуске", "Предлагать промежуточные сборки", "Проверить обновления"} {
 		if !strings.Contains(helpText, label) {
 			t.Errorf("the help does not mention %q", label)
 		}

@@ -115,8 +115,15 @@ func (u *UI) showSettings() {
 				names := make([]string, len(models))
 				for i, m := range models {
 					names[i] = m.ID
+					var meta []string
 					if m.ContextLength > 0 {
-						names[i] += fmt.Sprintf(" (контекст %d)", m.ContextLength)
+						meta = append(meta, fmt.Sprintf("контекст %d", m.ContextLength))
+					}
+					if m.Vision {
+						meta = append(meta, "скриншоты")
+					}
+					if len(meta) > 0 {
+						names[i] += " (" + strings.Join(meta, ", ") + ")"
 					}
 				}
 				llmStatus.set("Колибри на связи: "+strings.Join(names, ", "), widget.SuccessImportance)
@@ -274,7 +281,7 @@ func (u *UI) showSettings() {
 		hint("0 токенов — без ограничения: ответ может занять весь контекст модели. Колибри шлёт сигнал каждые 10 секунд; если сервер молчит дольше указанного, запрос обрывается."),
 
 		sectionTitle("Браузер Lightpanda"),
-		hint("Когда Колибри нужны сведения об устройстве программы, протокола или библиотеки, Kolibri Forge выполняет её запросы в браузере Lightpanda (AGPL-3.0, запускается отдельным процессом с отключённой телеметрией) и возвращает найденное модели."),
+		hint("На Windows сразу работает встроенный нативный движок Lightpanda (HTML5 DOM, CSS-селекторы, чтение в Markdown, формы, поисковые системы и безголовый JS-рендеринг через Edge/Chrome) — без WSL и Docker. При наличии внешнего Lightpanda (Linux/macOS, WSL2, Docker или MCP-сервера) используется он."),
 		container.NewHBox(checkLP, installLP, lpLink),
 		lpStatus.label,
 		row("Путь к исполняемому файлу", lpPath),

@@ -46,6 +46,8 @@ type Entry struct {
 	Model string
 	// Summary is the model's one-line description of what it did.
 	Summary string
+	// Screenshots lists attached user screenshots examined during this step.
+	Screenshots []string
 	// Web lists brief descriptions of searches and pages read through
 	// Lightpanda while carrying out this step.
 	Web []string
@@ -78,6 +80,13 @@ func Append(doc string, e Entry) string {
 	}
 	if e.Summary != "" {
 		fmt.Fprintf(&b, "- **Сделано:** %s\n", oneLine(e.Summary, 300))
+	}
+	if len(e.Screenshots) > 0 {
+		cleaned := make([]string, len(e.Screenshots))
+		for i, s := range e.Screenshots {
+			cleaned[i] = oneLine(s, 100)
+		}
+		fmt.Fprintf(&b, "- **Скриншоты:** %s\n", strings.Join(cleaned, ", "))
 	}
 	if len(e.Web) > 0 {
 		const maxListed = 15

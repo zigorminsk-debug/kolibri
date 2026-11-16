@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -35,7 +36,7 @@ func TestModels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 2 || models[0] != (Model{"a", 65536}) || models[1] != (Model{"b", 4096}) {
+	if len(models) != 2 || models[0] != (Model{ID: "a", ContextLength: 65536}) || models[1] != (Model{ID: "b", ContextLength: 4096}) {
 		t.Errorf("models = %+v", models)
 	}
 
@@ -207,5 +208,57 @@ func TestChatStreamCutShort(t *testing.T) {
 	}, time.Second)
 	if err != nil || res.Content != "whole" {
 		t.Errorf("no [DONE]: res = %+v, err = %v", res, err)
+	}
+}
+
+func TestVisionModelsAndMultimodalMessages(t *testing.T) {
+	var seenRaw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			fmt.Fprint(w, `{"data":[
+				{"id":"qwen36-vl","context_length":32768,"input_modalities":["text","image"]},
+				{"id":"qwen35-coder","context_length":32768,"input_modalities":["text"]}
+			]}`)
+		case "/v1/chat/completions":
+			seenRaw, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"nil pointer at main.go:42\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+		}
+	}))
+	defer srv.Close()
+
+	c := &Client{BaseURL: srv.URL}
+	models, err := c.Models(context.Background())
+	if err != nil || len(models) != 2 {
+		t.Fatalf("Models: %v %+v", err, models)
+	}
+	if !models[0].Vision || models[1].Vision {
+		t.Fatalf("Vision flags = %+v", models)
+	}
+
+	res, err := c.ChatStream(context.Background(), ChatRequest{
+		Model: "qwen36-vl",
+		Messages: []Message{
+			{Role: "system", Content: "sys"},
+			{Role: "user", Content: "fix crash", Images: []Image{{DataURI: "data:image/png;base64,AAAA"}}},
+		},
+	}, nil)
+	if err != nil || res.Content != "nil pointer at main.go:42" {
+		t.Fatalf("ChatStream: res=%+v err=%v", res, err)
+	}
+	raw := string(seenRaw)
+	if !strings.Contains(raw, `"content":"sys"`) || !strings.Contains(raw, `"type":"image_url"`) || !strings.Contains(raw, `"data:image/png;base64,AAAA"`) {
+		t.Fatalf("unexpected wire payload: %s", raw)
+	}
+
+	if !VisionUnsupported(&APIError{Status: 400, Code: "unsupported_content_type", Message: "model does not support vision"}) {
+		t.Error("expected VisionUnsupported=true")
+	}
+	if !MissingVisionDeps(&APIError{Status: 400, Message: "image input requires Pillow and numpy"}) {
+		t.Error("expected MissingVisionDeps=true")
+	}
+	if !BodyTooLarge(&APIError{Status: 413, Message: "request body exceeds 4 MiB"}) {
+		t.Error("expected BodyTooLarge=true")
 	}
 }

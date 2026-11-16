@@ -29,6 +29,7 @@ import (
 	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
 	"github.com/zigorminsk-debug/kolibri/internal/pipeline"
 	"github.com/zigorminsk-debug/kolibri/internal/runlog"
+	"github.com/zigorminsk-debug/kolibri/internal/screenshot"
 	"github.com/zigorminsk-debug/kolibri/internal/update"
 	"github.com/zigorminsk-debug/kolibri/internal/workflow"
 )
@@ -53,6 +54,7 @@ type UI struct {
 	lpManagedDir  string
 	version       *update.Current
 	goosOverride  string
+	readClipboard func(context.Context, string) (screenshot.Image, error)
 
 	// update strip under the header, and what it offers
 	top          *fyne.Container
@@ -85,6 +87,10 @@ type UI struct {
 	// targetHint explains what the Android choice gives and requires.
 	targetHint *widget.Label
 	formTop    *fyne.Container
+	shotPick   *widget.Button
+	shotPaste  *widget.Button
+	shotBar    *fyne.Container
+	shots      []screenshot.Image
 	prompt     *widget.Entry
 	fixes      *widget.Select
 	useWeb     *widget.Check
@@ -147,6 +153,7 @@ func New(app fyne.App, win fyne.Window, cfg config.Config) *UI {
 	u := &UI{app: app, win: win, cfg: cfg, kindInfos: workflow.Kinds()}
 	u.Save = func(c config.Config) error { return c.Save() }
 	win.SetContent(u.layout())
+	win.SetOnDropped(u.onFilesDropped)
 	u.journal.sink = func(level pipeline.Level, msg string, at time.Time) {
 		u.Log.Line(at, levelMarks[level], msg)
 	}
@@ -288,10 +295,17 @@ func (u *UI) formPanel() fyne.CanvasObject {
 	u.targetHint = hint("")
 	u.targetHint.Hide()
 
+	u.shotPick = widget.NewButtonWithIcon("Скриншот", theme.FileImageIcon(), u.pickScreenshot)
+	u.shotPick.Importance = widget.LowImportance
+	u.shotPaste = widget.NewButtonWithIcon("Буфер", theme.ContentPasteIcon(), u.pasteScreenshot)
+	u.shotPaste.Importance = widget.LowImportance
+	u.shotBar = container.New(&flowLayout{})
+	u.shotBar.Hide()
+
 	u.prompt = widget.NewMultiLineEntry()
 	u.prompt.Wrapping = fyne.TextWrapWord
 	u.prompt.SetMinRowsVisible(2)
-	u.prompt.SetPlaceHolder("Например: посмотри как устроена программа Radmin VPN и сделай аналогичную для локального использования")
+	u.prompt.SetPlaceHolder("Опишите задачу или приложите скриншот ошибки упавшей программы — Колибри изучит его и исправит код")
 	u.prompt.OnChanged = func(string) { u.clearProblem() }
 
 	u.fixes = widget.NewSelect([]string{"не исправлять", "1 раз", "2 раза", "3 раза", "4 раза", "5 раз"}, nil)
@@ -311,6 +325,11 @@ func (u *UI) formPanel() fyne.CanvasObject {
 		container.NewVBox(fieldLabel("Ветка"), fixed(118, u.branch.MinSize().Height, u.branch)),
 		container.NewVBox(fieldLabel("Репозиторий на GitHub"), u.repo))
 
+	promptHead := container.NewBorder(nil, nil,
+		container.NewCenter(fieldLabel("Что нужно сделать")),
+		container.NewThemeOverride(container.NewHBox(u.shotPick, u.shotPaste), denseTheme{}),
+	)
+
 	u.formTop = container.NewVBox(
 		text("Новая задача", 17, colText, fyne.TextStyle{Bold: true}),
 		gap(0, 2),
@@ -320,7 +339,8 @@ func (u *UI) formPanel() fyne.CanvasObject {
 		fieldLabel("Собрать для"),
 		u.targetRow,
 		u.targetHint,
-		fieldLabel("Что нужно сделать"),
+		promptHead,
+		u.shotBar,
 	)
 	checks := container.NewThemeOverride(container.NewVBox(u.useWeb, u.private, u.release), denseTheme{})
 	u.formFoot = container.NewVBox(
@@ -547,7 +567,7 @@ func (u *UI) setFormEnabled(on bool) {
 		Enable()
 		Disable()
 	}
-	controls := []toggler{u.repo, u.repoPick, u.branch, u.kind, u.prompt, u.fixes, u.useWeb, u.private, u.release}
+	controls := []toggler{u.repo, u.repoPick, u.branch, u.kind, u.shotPick, u.shotPaste, u.prompt, u.fixes, u.useWeb, u.private, u.release}
 	for _, c := range controls {
 		if on {
 			c.Enable()
@@ -556,6 +576,7 @@ func (u *UI) setFormEnabled(on bool) {
 		}
 	}
 	u.syncTargets()
+	u.refreshShotBar()
 }
 
 // ---- running a task -----------------------------------------------------
@@ -590,8 +611,8 @@ func (u *UI) taskFromForm() (pipeline.Task, error) {
 	if err != nil {
 		return pipeline.Task{}, err
 	}
-	if strings.TrimSpace(u.prompt.Text) == "" {
-		return pipeline.Task{}, errors.New("опишите, что нужно сделать")
+	if strings.TrimSpace(u.prompt.Text) == "" && len(u.shots) == 0 {
+		return pipeline.Task{}, errors.New("опишите, что нужно сделать, или приложите скриншот ошибки")
 	}
 	kind := u.selectedKind()
 	targets := u.selectedTargets()
@@ -601,8 +622,10 @@ func (u *UI) taskFromForm() (pipeline.Task, error) {
 		}
 		return pipeline.Task{}, errors.New("отметьте хотя бы одну систему, для которой собирать программу")
 	}
+	shots := append([]screenshot.Image(nil), u.shots...)
 	return pipeline.Task{
 		Prompt:      u.prompt.Text,
+		Screenshots: shots,
 		Owner:       owner,
 		Repo:        name,
 		Branch:      strings.TrimSpace(u.branch.Text),
@@ -689,6 +712,7 @@ func (u *UI) finishRun(out pipeline.Outcome, err error) {
 	var cut *pipeline.InterruptedError
 	switch {
 	case err == nil:
+		u.clearScreenshots()
 		u.setStages(pipeline.StageDeliver+1, false)
 		u.showResult(out)
 	case errors.As(err, &cut):

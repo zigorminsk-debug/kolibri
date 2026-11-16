@@ -174,6 +174,10 @@ type promptExtra struct {
 	history string
 	// resume tells the model that it continues a reply that was cut short.
 	resume string
+	// vision holds transcribed findings or OCR text from attached screenshots.
+	vision string
+	// inlineImage notes that a screenshot image is attached to this turn.
+	inlineImage bool
 	// web holds Lightpanda search and page findings gathered so far.
 	web string
 	// useWeb includes Lightpanda browser instructions in the system prompt.
@@ -188,6 +192,14 @@ func systemPromptFor(useWeb bool) string {
 }
 
 func (e promptExtra) write(b *strings.Builder) {
+	if e.inlineImage {
+		b.WriteString("\n\n")
+		b.WriteString(inlineScreenshotHint)
+	}
+	if e.vision != "" {
+		b.WriteString("\n\n")
+		b.WriteString(e.vision)
+	}
 	if e.resume != "" {
 		b.WriteString("\n\nContinuation: ")
 		b.WriteString(e.resume)

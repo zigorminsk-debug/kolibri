@@ -248,6 +248,21 @@ func (b *Browser) installWindows(ctx context.Context, report ProgressFunc) (Stat
 		return Status{Version: ver, Mode: ModeDocker, Location: DockerImage}, nil
 	}
 
+	if !b.DisableNative {
+		report(0, 0, "Проверяю встроенный движок Lightpanda для Windows…")
+		sess, err := newNativeSession(b)
+		if err != nil {
+			return Status{}, err
+		}
+		_ = sess.Close()
+		// Smoke-test HTML5 DOM + reader Markdown conversion in memory.
+		probe := parseHTML("<main><h1>Lightpanda</h1><p>ok</p></main>", "https://example.com/")
+		if !strings.Contains(probe.renderMarkdown(probe.Root, renderOpts{stripClutter: true}), "# Lightpanda") {
+			return Status{}, errors.New("самопроверка встроенного движка Lightpanda не прошла")
+		}
+		return b.nativeStatus(), nil
+	}
+
 	return Status{}, errors.New("у Lightpanda нет отдельного .exe для Windows: установите подсистему Linux командой «wsl --install» (и перезагрузите компьютер), либо запустите Docker Desktop, либо укажите адрес MCP-сервера Lightpanda на Linux-машине")
 }
 

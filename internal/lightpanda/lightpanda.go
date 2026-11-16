@@ -23,6 +23,7 @@ const (
 	ModeHTTP   = "http"
 	ModeWSL    = "wsl"
 	ModeDocker = "docker"
+	ModeNative = "native"
 )
 
 // SearchProvider describes one of Lightpanda's built-in search backends.
@@ -75,6 +76,8 @@ func (s Status) Label() string {
 		return v + " · Docker"
 	case ModeHTTP:
 		return v + " · MCP"
+	case ModeNative:
+		return v + " · встроенный"
 	default:
 		return v
 	}
@@ -139,12 +142,20 @@ type Browser struct {
 	// MaxResultBytes bounds the text handed back to the model per action (default 14 KB).
 	MaxResultBytes int
 
-	// HTTP, ReleasesURL, AllowLoopback, SearchFallbackURL, GOOS and GOARCH are
-	// overrides used in tests.
+	// ForceNative uses the built-in Go engine even when an external Lightpanda
+	// binary is installed; DisableNative turns off the automatic fallback so
+	// callers can probe solely for the standalone binary.
+	ForceNative   bool
+	DisableNative bool
+
+	// HTTP and the remaining fields are overrides used in tests.
 	HTTP              *http.Client
 	ReleasesURL       string
 	AllowLoopback     bool
 	SearchFallbackURL string
+	SearchAPIBase     string
+	JSBrowserPath     string
+	DisableJSBridge   bool
 	GOOS              string
 	GOARCH            string
 }
@@ -163,7 +174,20 @@ func (b *Browser) maxResultBytes() int {
 	return defaultMaxResultBytes
 }
 
+func (b *Browser) nativeStatus() Status {
+	loc := "встроенный движок"
+	if b.goos() == "windows" {
+		loc = "встроенный движок для Windows"
+	}
+	if js := b.findJSBrowser(); js.Name != "" {
+		loc += " + JS через " + js.Name
+	}
+	return Status{Version: NativeEngineVersion, Mode: ModeNative, Location: loc}
+}
+
 // Check verifies that Lightpanda is reachable and returns its version and mode.
+// When no standalone binary, WSL2 or Docker installation is present (the normal
+// case on Windows), Check reports the built-in native Go engine.
 func (b *Browser) Check(ctx context.Context) (Status, error) {
 	if raw := strings.TrimSpace(b.MCPURL); raw != "" {
 		conn, info, err := newHTTPConn(ctx, raw, b.HTTP)
@@ -177,11 +201,19 @@ func (b *Browser) Check(ctx context.Context) (Status, error) {
 		}
 		return Status{Version: ver, Mode: ModeHTTP, Location: raw}, nil
 	}
+	if b.ForceNative && strings.TrimSpace(b.BinaryPath) == "" {
+		return b.nativeStatus(), nil
+	}
 	st, _, err := b.resolveLocal(ctx)
+	if err != nil && errors.Is(err, ErrNotInstalled) && !b.DisableNative {
+		return b.nativeStatus(), nil
+	}
 	return st, err
 }
 
-// Open starts an isolated Lightpanda MCP session.
+// Open starts an isolated browsing session: over MCP when a standalone
+// Lightpanda binary, WSL2/Docker install or MCP server is available, or using
+// the built-in Go engine otherwise.
 func (b *Browser) Open(ctx context.Context) (Session, error) {
 	var conn mcpConn
 	if raw := strings.TrimSpace(b.MCPURL); raw != "" {
@@ -190,9 +222,14 @@ func (b *Browser) Open(ctx context.Context) (Session, error) {
 			return nil, err
 		}
 		conn = c
+	} else if b.ForceNative && strings.TrimSpace(b.BinaryPath) == "" {
+		return newNativeSession(b)
 	} else {
 		_, spawn, err := b.resolveLocal(ctx)
 		if err != nil {
+			if errors.Is(err, ErrNotInstalled) && !b.DisableNative {
+				return newNativeSession(b)
+			}
 			return nil, err
 		}
 		c, _, err := newStdioConn(ctx, spawn)

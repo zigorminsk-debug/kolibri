@@ -1,10 +1,13 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
+	"image"
+	"image/color"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +22,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 
@@ -27,6 +31,7 @@ import (
 	"github.com/zigorminsk-debug/kolibri/internal/lightpanda"
 	"github.com/zigorminsk-debug/kolibri/internal/pipeline"
 	"github.com/zigorminsk-debug/kolibri/internal/runlog"
+	"github.com/zigorminsk-debug/kolibri/internal/screenshot"
 )
 
 var shots = flag.String("shots", "", "write screenshots of the main states into this directory")
@@ -709,5 +714,84 @@ func TestWebResearchViewAndSettings(t *testing.T) {
 				t.Error("Settings check button did not report Lightpanda 1.0.4")
 			}
 		}
+	}
+}
+
+func TestWindowsNativeLightpandaAndScreenshots(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	u, _ := newTestUI(t, config.Default(), 1180, 740)
+	u.goosOverride = "windows"
+	u.lpManagedDir = t.TempDir()
+
+	// 1. On Windows without WSL2 or Docker, both Install and Check report the
+	// built-in native Lightpanda engine as ready (no red WSL/Docker error).
+	u.showSettings()
+	installBtn := findButton(t, u, "Установить Lightpanda")
+	u.do(func() { test.Tap(installBtn) })
+	u.bg.Wait()
+	var sawWinNative bool
+	walk(u, func(o fyne.CanvasObject) {
+		if l, ok := o.(*widget.Label); ok && strings.Contains(l.Text, "встроенный движок для Windows") && strings.Contains(l.Text, "WSL и Docker не требуются") {
+			sawWinNative = true
+		}
+	})
+	if !sawWinNative {
+		t.Fatal("Windows Settings did not report built-in Lightpanda engine")
+	}
+	for _, c := range u.win.Canvas().Overlays().List() {
+		c.Hide()
+	}
+
+	// 2. Attach crash screenshots via drag-and-drop and via clipboard paste,
+	// preview, remove one, and submit with an empty text prompt.
+	img := image.NewNRGBA(image.Rect(0, 0, 320, 180))
+	img.SetNRGBA(10, 10, color.NRGBA{R: 200, G: 40, B: 40, A: 255})
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	shotPath := filepath.Join(t.TempDir(), "app-crash.png")
+	if err := os.WriteFile(shotPath, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	u.do(func() {
+		u.onFilesDropped(fyne.Position{}, []fyne.URI{storage.NewFileURI(shotPath)})
+	})
+	u.bg.Wait()
+	if len(u.shots) != 1 || u.shots[0].Name != "app-crash.png" || !u.shotBar.Visible() {
+		t.Fatalf("after drop: shots=%d visible=%v", len(u.shots), u.shotBar.Visible())
+	}
+
+	clipIm, err := screenshot.Decode("clipboard.png", buf.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.readClipboard = func(context.Context, string) (screenshot.Image, error) {
+		return clipIm, nil
+	}
+	u.do(func() { test.Tap(u.shotPaste) })
+	u.bg.Wait()
+	if len(u.shots) != 2 {
+		t.Fatalf("after paste: shots=%d, want 2", len(u.shots))
+	}
+
+	u.repo.SetText("alice/demo")
+	u.prompt.SetText("")
+	task, err := u.taskFromForm()
+	if err != nil {
+		t.Fatalf("taskFromForm with screenshot only: %v", err)
+	}
+	if len(task.Screenshots) != 2 {
+		t.Fatalf("task.Screenshots=%d, want 2", len(task.Screenshots))
+	}
+
+	u.do(func() { u.removeScreenshot(0) })
+	if len(u.shots) != 1 || u.shots[0].Name != "clipboard.png" {
+		t.Fatalf("after removeScreenshot: %+v", u.shots)
+	}
+	u.do(func() { u.clearScreenshots() })
+	if len(u.shots) != 0 || u.shotBar.Visible() {
+		t.Fatalf("after clearScreenshots: shots=%d visible=%v", len(u.shots), u.shotBar.Visible())
 	}
 }

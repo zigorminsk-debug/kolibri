@@ -19,6 +19,7 @@ import (
 	"github.com/zigorminsk-debug/kolibri/internal/colibri"
 	"github.com/zigorminsk-debug/kolibri/internal/ghapi"
 	"github.com/zigorminsk-debug/kolibri/internal/lightpanda"
+	"github.com/zigorminsk-debug/kolibri/internal/screenshot"
 	"github.com/zigorminsk-debug/kolibri/internal/workflow"
 	"github.com/zigorminsk-debug/kolibri/internal/worklog"
 )
@@ -91,6 +92,10 @@ type Task struct {
 	Release bool
 	// OutputDir is where artifacts are unpacked; "" skips the download.
 	OutputDir string
+
+	// Screenshots are optional images attached by the user (e.g. a crash
+	// dialog, stack trace or broken window of the program being tested).
+	Screenshots []screenshot.Image
 
 	// UseWeb allows the model to ask Kolibri Forge to run internet searches
 	// and browse pages through Lightpanda while solving the task.
@@ -170,6 +175,9 @@ type Runner struct {
 	RunStartTimeout time.Duration
 	// BuildTimeout bounds one build (default 60m).
 	BuildTimeout time.Duration
+	// OCR optionally overrides local text recognition used when a text-only
+	// colibri model rejects image input (defaults to screenshot.ExtractText).
+	OCR func(context.Context, screenshot.Image) (string, error)
 }
 
 func (r *Runner) pollInterval() time.Duration {
@@ -226,6 +234,12 @@ type state struct {
 	// lastError is the most telling line of the latest build failure.
 	lastError string
 
+	// Screenshots attached to the task and any transcribed findings / OCR text.
+	shots       []screenshot.Image
+	inlineShot  *screenshot.Image
+	visionNotes string
+	visionOff   bool
+
 	// Lightpanda browser session and findings accumulated during this run.
 	webSess  lightpanda.Session
 	webOff   string // reason Lightpanda was turned off mid-run, "" while usable
@@ -261,14 +275,18 @@ type commitKind struct {
 // Run executes a task. It returns when the build is green and downloaded,
 // when it gives up, or when ctx is cancelled.
 func (r *Runner) Run(ctx context.Context, task Task) (out Outcome, err error) {
+	shots := normalizeScreenshots(task.Screenshots)
 	if strings.TrimSpace(task.Prompt) == "" {
-		return Outcome{}, errors.New("опишите задачу")
+		if len(shots) == 0 {
+			return Outcome{}, errors.New("опишите задачу")
+		}
+		task.Prompt = defaultScreenshotPrompt
 	}
 	if task.MaxFixes < 0 {
 		task.MaxFixes = 0
 	}
 	st := &state{
-		task: task, modes: map[string]string{}, project: map[string]string{},
+		task: task, shots: shots, modes: map[string]string{}, project: map[string]string{},
 		opaque: map[string]bool{}, webCache: map[string]int{},
 	}
 	defer st.closeWeb()
@@ -286,6 +304,13 @@ func (r *Runner) Run(ctx context.Context, task Task) (out Outcome, err error) {
 	}
 	// However the run ends, the log in the repository says how.
 	defer func() { r.closeLog(ctx, st, &out, err) }()
+
+	if len(st.shots) > 0 {
+		r.Obs.Stage(StageGenerate, 1, total)
+		if err := r.prepareScreenshots(ctx, st); err != nil {
+			return out, err
+		}
+	}
 
 	failure := ""
 	for attempt := 1; ; attempt++ {
@@ -463,10 +488,14 @@ func (r *Runner) prepare(ctx context.Context, st *state) error {
 		}
 	}
 	st.model, st.ctxLen = chosen.ID, chosen.ContextLength
+	visionTag := ""
+	if chosen.Vision {
+		visionTag = ", чтение скриншотов"
+	}
 	if st.ctxLen > 0 {
-		r.logf(Info, "Колибри на связи: модель %s, контекст %d токенов", st.model, st.ctxLen)
+		r.logf(Info, "Колибри на связи: модель %s, контекст %d токенов%s", st.model, st.ctxLen, visionTag)
 	} else {
-		r.logf(Info, "Колибри на связи: модель %s", st.model)
+		r.logf(Info, "Колибри на связи: модель %s%s", st.model, visionTag)
 	}
 
 	user, err := r.GH.CurrentUser(ctx)
@@ -776,7 +805,11 @@ func (r *Runner) generate(ctx context.Context, st *state, failure, resume string
 
 		lastWebCtx = makeWeb(wBudget)
 		sys := systemPromptFor(allowWeb)
-		fixed := len(sys) + len(task.Prompt) + len(failure) + len(history) + len(resume) + len(lastWebCtx) + 1500
+		fixed := len(sys) + len(task.Prompt) + len(failure) + len(history) + len(resume) + len(st.visionNotes) + len(lastWebCtx) + 1800
+		if st.inlineShot != nil && !st.visionOff && failure == "" && resume == "" {
+			// Reserve token room for the vision encoder's image tokens (~1500 tokens).
+			fixed += 5000
+		}
 		fBudget := fileBudget(st.ctxLen, task.MaxTokens, fixed)
 
 		var askErr error
@@ -791,21 +824,43 @@ func (r *Runner) generate(ctx context.Context, st *state, failure, resume string
 			if len(rounds) > 0 {
 				title += fmt.Sprintf(" — после поиска %d", len(rounds))
 			}
-			extra := promptExtra{history: history, resume: resume, web: lastWebCtx, useWeb: allowWeb}
+			withInline := st.inlineShot != nil && !st.visionOff && failure == "" && resume == ""
+			extra := promptExtra{
+				history:     history,
+				resume:      resume,
+				vision:      st.visionNotes,
+				inlineImage: withInline,
+				web:         lastWebCtx,
+				useWeb:      allowWeb,
+			}
 			var messages []colibri.Message
 			if failure == "" {
 				messages = taskMessages(task, kind, st.project, st.opaquePaths(), fBudget, extra)
 			} else {
 				messages = fixMessages(task, kind, st.project, st.opaquePaths(), fBudget, failure, extra)
 			}
+			shot, hasShot := attachInlineShot(st, messages, failure, resume, shrink)
 			r.Obs.ModelStart(title)
-			r.logf(Info, "Отправляю запрос модели %s (%s)", st.model, sizeText(messagesLen(messages)))
+			if hasShot {
+				r.logf(Info, "Отправляю запрос модели %s (%s + скриншот %s, %s)",
+					st.model, sizeText(messagesLen(messages)), shot.Name, sizeText(len(shot.Data)))
+			} else {
+				r.logf(Info, "Отправляю запрос модели %s (%s)", st.model, sizeText(messagesLen(messages)))
+			}
 
 			reply, cutOff, broken, askErr = r.ask(ctx, st, messages)
 			if askErr == nil {
 				break
 			}
-			if colibri.ContextExceeded(askErr) && shrink < 3 && (fBudget > 0 || (len(lastWebCtx) > 2500)) {
+			if hasShot && colibri.VisionUnsupported(askErr) {
+				if ocrErr := r.fallbackToOCR(ctx, st, askErr); ocrErr != nil {
+					askErr = ocrErr
+					break
+				}
+				continue
+			}
+			if (colibri.ContextExceeded(askErr) || (hasShot && colibri.BodyTooLarge(askErr))) &&
+				shrink < 3 && (fBudget > 0 || len(lastWebCtx) > 2500 || hasShot) {
 				fBudget /= 2
 				if shrink >= 1 {
 					fBudget = 0
@@ -1126,8 +1181,9 @@ func (r *Runner) commit(ctx context.Context, st *state, gen generation, kind com
 		Summary: st.summary, Web: st.webNotes, Files: gen.files, Unfinished: gen.partial, Next: st.next,
 	}
 	if !st.logged {
-		// The task is written once per run; later entries belong to it.
+		// The task and attached screenshots are written once per run; later entries belong to it.
 		entry.Task = st.task.Prompt
+		entry.Screenshots = shotLabels(st.shots)
 	}
 	switch {
 	case kind.fix:

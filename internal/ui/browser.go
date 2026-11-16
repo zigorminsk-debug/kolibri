@@ -63,6 +63,8 @@ func (u *UI) checkLightpandaInto(b *lightpanda.Browser, btn *widget.Button, st *
 				st.set("Lightpanda не установлен. Нажмите «Установить Lightpanda» или укажите адрес запущенного MCP-сервера.", widget.WarningImportance)
 			case err != nil:
 				st.set(capitalize(err.Error()), widget.DangerImportance)
+			case info.Mode == lightpanda.ModeNative:
+				st.set("Готов: "+info.Detail()+" — работает сразу, WSL и Docker не требуются.", widget.SuccessImportance)
 			default:
 				st.set(info.Detail()+".", widget.SuccessImportance)
 			}
@@ -105,7 +107,11 @@ func (u *UI) installLightpandaInto(b *lightpanda.Browser, installBtn, checkBtn *
 				st.set(capitalize(err.Error()), widget.DangerImportance)
 				return
 			}
-			st.set("Установлено: "+info.Detail()+".", widget.SuccessImportance)
+			if info.Mode == lightpanda.ModeNative {
+				st.set("Активирован "+info.Detail()+" — отдельная установка, WSL и Docker не требуются.", widget.SuccessImportance)
+			} else {
+				st.set("Установлено: "+info.Detail()+".", widget.SuccessImportance)
+			}
 			if onInstalled != nil {
 				onInstalled(info)
 			}

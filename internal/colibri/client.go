@@ -31,17 +31,108 @@ type Client struct {
 	HTTP *http.Client
 }
 
+// MaxBodyBytes is colibri's hard HTTP body ceiling (4 MiB in openai_server.py).
+const MaxBodyBytes = 4 << 20
+
 // Model is one entry of GET /v1/models.
 type Model struct {
 	ID string
 	// ContextLength is the context window in tokens, 0 when the server does not say.
 	ContextLength int
+	// Vision reports whether the server advertised image input support
+	// (`input_modalities` includes "image").
+	Vision bool
 }
 
-// Message is one chat turn.
+// Image is an inline screenshot sent in a multimodal user message.
+type Image struct {
+	// DataURI is a `data:image/<fmt>;base64,...` string as required by colibri.
+	DataURI string
+}
+
+// Message is one chat turn. When Images is empty it marshals `content` as a
+// plain string; when Images is non-empty it marshals OpenAI/colibri multimodal
+// content parts (`image_url` followed by `text`).
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string
+	Content string
+	Images  []Image
+}
+
+type contentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *imageURL `json:"image_url,omitempty"`
+}
+
+type imageURL struct {
+	URL string `json:"url"`
+}
+
+// MarshalJSON encodes plain-text messages with a string content field and
+// multimodal messages with an array of content parts.
+func (m Message) MarshalJSON() ([]byte, error) {
+	if len(m.Images) == 0 {
+		return json.Marshal(struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		}{Role: m.Role, Content: m.Content})
+	}
+	parts := make([]contentPart, 0, len(m.Images)+1)
+	for _, im := range m.Images {
+		if im.DataURI == "" {
+			continue
+		}
+		parts = append(parts, contentPart{
+			Type:     "image_url",
+			ImageURL: &imageURL{URL: im.DataURI},
+		})
+	}
+	if m.Content != "" || len(parts) == 0 {
+		parts = append(parts, contentPart{Type: "text", Text: m.Content})
+	}
+	return json.Marshal(struct {
+		Role    string        `json:"role"`
+		Content []contentPart `json:"content"`
+	}{Role: m.Role, Content: parts})
+}
+
+// UnmarshalJSON decodes either a plain string content field or multimodal parts.
+func (m *Message) UnmarshalJSON(data []byte) error {
+	var wire struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	m.Role = wire.Role
+	m.Content = ""
+	m.Images = nil
+	trimmed := bytes.TrimSpace(wire.Content)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	if trimmed[0] == '"' {
+		return json.Unmarshal(trimmed, &m.Content)
+	}
+	var parts []contentPart
+	if err := json.Unmarshal(trimmed, &parts); err != nil {
+		return err
+	}
+	var texts []string
+	for _, p := range parts {
+		switch p.Type {
+		case "text":
+			texts = append(texts, p.Text)
+		case "image_url":
+			if p.ImageURL != nil && p.ImageURL.URL != "" {
+				m.Images = append(m.Images, Image{DataURI: p.ImageURL.URL})
+			}
+		}
+	}
+	m.Content = strings.Join(texts, "\n")
+	return nil
 }
 
 // ChatRequest is what a generation needs.
@@ -91,15 +182,76 @@ func (e *APIError) Error() string {
 		return fmt.Sprintf("Колибри отклонил запрос (%d): проверьте API-ключ в настройках. %s", e.Status, msg)
 	case e.Code == "context_length_exceeded":
 		return "запрос не помещается в контекст модели: " + msg
+	case e.missingVisionDeps():
+		return "на сервере Колибри для чтения скриншотов нужны библиотеки Pillow и numpy (выполните «pip install pillow numpy» на машине с colibri): " + msg
+	case e.visionUnsupported():
+		return "текущая модель Колибри не поддерживает чтение изображений (запустите мультимодальную модель с --mmproj или поддержкой vision): " + msg
+	case e.bodyTooLarge():
+		return "запрос со скриншотом превысил допустимый размер тела на сервере Колибри: " + msg
 	default:
 		return fmt.Sprintf("Колибри ответил ошибкой %d: %s", e.Status, msg)
 	}
+}
+
+func (e *APIError) visionUnsupported() bool {
+	if e.Code == "unsupported_content_type" {
+		return true
+	}
+	if e.Status != http.StatusBadRequest && e.Status != http.StatusUnprocessableEntity {
+		return false
+	}
+	low := strings.ToLower(e.Message)
+	for _, needle := range []string{
+		"does not support vision",
+		"does not support image",
+		"image input is not supported",
+		"vision is not enabled",
+		"mmproj",
+		"unsupported content type: image",
+	} {
+		if strings.Contains(low, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *APIError) missingVisionDeps() bool {
+	low := strings.ToLower(e.Message)
+	return strings.Contains(low, "pillow") && strings.Contains(low, "numpy")
+}
+
+func (e *APIError) bodyTooLarge() bool {
+	if e.Status == http.StatusRequestEntityTooLarge {
+		return true
+	}
+	low := strings.ToLower(e.Message)
+	return strings.Contains(low, "request body exceeds") || strings.Contains(low, "payload too large")
 }
 
 // ContextExceeded reports whether err says the prompt does not fit the model's context.
 func ContextExceeded(err error) bool {
 	var api *APIError
 	return errors.As(err, &api) && api.Code == "context_length_exceeded"
+}
+
+// VisionUnsupported reports whether the server rejected an image because the
+// loaded model has no vision tower.
+func VisionUnsupported(err error) bool {
+	var api *APIError
+	return errors.As(err, &api) && api.visionUnsupported() && !api.missingVisionDeps()
+}
+
+// MissingVisionDeps reports whether colibri's openai_server lacks Pillow/numpy.
+func MissingVisionDeps(err error) bool {
+	var api *APIError
+	return errors.As(err, &api) && api.missingVisionDeps()
+}
+
+// BodyTooLarge reports whether the HTTP body exceeded the server's size limit.
+func BodyTooLarge(err error) bool {
+	var api *APIError
+	return errors.As(err, &api) && api.bodyTooLarge()
 }
 
 // ErrCutShort is returned, together with the text received so far, when the
@@ -192,9 +344,14 @@ func (c *Client) Models(ctx context.Context) ([]Model, error) {
 	}
 	var payload struct {
 		Data []struct {
-			ID            string `json:"id"`
-			ContextLength int    `json:"context_length"`
-			MaxModelLen   int    `json:"max_model_len"`
+			ID              string   `json:"id"`
+			ContextLength   int      `json:"context_length"`
+			MaxModelLen     int      `json:"max_model_len"`
+			InputModalities []string `json:"input_modalities"`
+			Vision          bool     `json:"vision"`
+			Architecture    struct {
+				InputModalities []string `json:"input_modalities"`
+			} `json:"architecture"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&payload); err != nil {
@@ -209,9 +366,19 @@ func (c *Client) Models(ctx context.Context) ([]Model, error) {
 		if ctxLen == 0 {
 			ctxLen = m.MaxModelLen
 		}
-		models = append(models, Model{ID: m.ID, ContextLength: ctxLen})
+		vision := m.Vision || hasImageModality(m.InputModalities) || hasImageModality(m.Architecture.InputModalities)
+		models = append(models, Model{ID: m.ID, ContextLength: ctxLen, Vision: vision})
 	}
 	return models, nil
+}
+
+func hasImageModality(mods []string) bool {
+	for _, mod := range mods {
+		if strings.EqualFold(strings.TrimSpace(mod), "image") {
+			return true
+		}
+	}
+	return false
 }
 
 type chatPayload struct {

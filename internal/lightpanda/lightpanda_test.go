@@ -569,12 +569,14 @@ func TestInstallDownloadsAndVerifiesBinary(t *testing.T) {
 		GOOS:        "linux",
 		GOARCH:      "amd64",
 	}
-	if _, err := b.Check(context.Background()); !errors.Is(err, ErrNotInstalled) {
-		// Ignore if the host happens to have lightpanda in PATH; test with empty PATH.
-		t.Setenv("PATH", "/bin:/usr/bin")
-		if _, err := b.Check(context.Background()); !errors.Is(err, ErrNotInstalled) {
-			t.Fatalf("before install: err = %v", err)
-		}
+	t.Setenv("PATH", "/bin:/usr/bin")
+	if st0, err := b.Check(context.Background()); err != nil || st0.Mode != ModeNative {
+		t.Fatalf("before install: want built-in ModeNative, got st=%+v err=%v", st0, err)
+	}
+	bStrict := *b
+	bStrict.DisableNative = true
+	if _, err := bStrict.Check(context.Background()); !errors.Is(err, ErrNotInstalled) {
+		t.Fatalf("before install (DisableNative): err = %v", err)
 	}
 
 	var stages []string
