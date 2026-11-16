@@ -718,6 +718,8 @@ func TestWebResearchViewAndSettings(t *testing.T) {
 }
 
 func TestWindowsNativeLightpandaAndScreenshots(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
 	t.Setenv("PATH", t.TempDir())
 	u, _ := newTestUI(t, config.Default(), 1180, 740)
 	u.goosOverride = "windows"

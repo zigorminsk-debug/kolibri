@@ -172,3 +172,21 @@ func (d denseTheme) Size(name fyne.ThemeSizeName) float32 {
 	}
 	return d.Theme.Size(name)
 }
+
+// microTheme styles inline caption actions (such as attaching a screenshot
+// next to a field heading) so they add no extra height to the task form.
+type microTheme struct{ Theme }
+
+func (m microTheme) Size(name fyne.ThemeSizeName) float32 {
+	switch name {
+	case theme.SizeNameText:
+		return 11.5
+	case theme.SizeNameInlineIcon:
+		return 13
+	case theme.SizeNameInnerPadding:
+		return 1.5
+	case theme.SizeNamePadding:
+		return 2
+	}
+	return m.Theme.Size(name)
+}

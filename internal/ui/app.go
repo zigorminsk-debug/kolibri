@@ -326,8 +326,9 @@ func (u *UI) formPanel() fyne.CanvasObject {
 		container.NewVBox(fieldLabel("Репозиторий на GitHub"), u.repo))
 
 	promptHead := container.NewBorder(nil, nil,
-		container.NewCenter(fieldLabel("Что нужно сделать")),
-		container.NewThemeOverride(container.NewHBox(u.shotPick, u.shotPaste), denseTheme{}),
+		fieldLabel("Что нужно сделать"),
+		container.New(layout.NewCustomPaddedLayout(4, 0, 0, 0),
+			container.NewThemeOverride(container.NewHBox(u.shotPick, u.shotPaste), microTheme{})),
 	)
 
 	u.formTop = container.NewVBox(
