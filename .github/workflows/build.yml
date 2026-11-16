@@ -42,15 +42,29 @@ jobs:
       - name: Vet
         run: go vet -tags ci ./...
       - name: Test
-        run: go test -race -tags ci ./...
-      - name: Test with Lightpanda
         run: |
+          set -o pipefail
+          if ! go test -race -tags ci ./... 2>&1 | tee /tmp/test.out; then
+            grep -E '(--- FAIL:|FAIL\t|\.go:[0-9]+:|WARNING: DATA RACE|panic:)' /tmp/test.out | head -n 15 | while IFS= read -r l; do
+              echo "::error::$l"
+            done
+            exit 1
+          fi
+      - name: Test with Lightpanda
+        if: always()
+        run: |
+          set -o pipefail
           lp="$RUNNER_TEMP/lightpanda"
           curl -fsSL --retry 3 -o "$lp" \
             https://github.com/lightpanda-io/browser/releases/download/1.0.4/lightpanda-x86_64-linux
           chmod +x "$lp"
           "$lp" version
-          LIGHTPANDA_TEST_BIN="$lp" go test -race -v -run 'TestRealLightpanda|TestRunWithRealLightpanda' ./internal/lightpanda ./internal/pipeline
+          if ! LIGHTPANDA_TEST_BIN="$lp" go test -race -v -run 'TestRealLightpanda|TestRunWithRealLightpanda' ./internal/lightpanda ./internal/pipeline 2>&1 | tee /tmp/lp.out; then
+            grep -E '(--- FAIL:|FAIL\t|\.go:[0-9]+:|WARNING: DATA RACE|panic:)' /tmp/lp.out | head -n 15 | while IFS= read -r l; do
+              echo "::error::$l"
+            done
+            exit 1
+          fi
 
   build:
     name: Build (${{ matrix.target }})
