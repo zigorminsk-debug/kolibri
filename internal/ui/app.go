@@ -887,9 +887,15 @@ func (u *UI) CheckConnections() {
 	u.checkSeq++
 	seq := u.checkSeq
 	u.llmChip.Set("Колибри · проверка…", toneBusy)
-	u.ghChip.Set("GitHub · проверка…", toneBusy)
 	llm, gh := u.clients()
 	wanted := u.cfg.Model
+	if gh.Token == "" {
+		u.ghOK = false
+		u.ghProblem = "Токен GitHub не задан. Войдите, чтобы программа могла отправлять код и следить за сборкой."
+		u.ghChip.Set("GitHub · войти", toneBad)
+	} else {
+		u.ghChip.Set("GitHub · проверка…", toneBusy)
+	}
 
 	u.spawn(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -922,9 +928,6 @@ func (u *UI) CheckConnections() {
 	})
 
 	if gh.Token == "" {
-		u.ghOK = false
-		u.ghProblem = "Токен GitHub не задан. Войдите, чтобы программа могла отправлять код и следить за сборкой."
-		u.ghChip.Set("GitHub · войти", toneBad)
 		return
 	}
 	u.spawn(func() {

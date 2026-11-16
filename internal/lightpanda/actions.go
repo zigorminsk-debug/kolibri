@@ -675,7 +675,7 @@ func (s *mcpSession) readCurrentMarkdown(ctx context.Context, selector string, m
 			text = strings.TrimSpace(lighter.Text)
 		}
 	}
-	return text, nil
+	return cleanMarkdown(text), nil
 }
 
 func (s *mcpSession) doOpen(ctx context.Context, a Action, res *Result) error {
@@ -940,11 +940,9 @@ func (s *mcpSession) doFill(ctx context.Context, a Action, res *Result) error {
 	if pout.IsError {
 		return errors.New(oneLine(pout.Text, 240))
 	}
-	wu := validWaitUntil(a.WaitUntil)
-	if wu == "" {
-		wu = "networkidle"
+	if wu := validWaitUntil(a.WaitUntil); wu != "" {
+		_, _ = s.conn.callTool(ctx, "waitForState", map[string]any{"state": wu, "timeout": 5000})
 	}
-	_, _ = s.conn.callTool(ctx, "waitForState", map[string]any{"state": wu, "timeout": 5000})
 	return s.snapshotAfterAction(ctx, pout, res)
 }
 
@@ -1170,4 +1168,116 @@ func capUTF8(s string, maxBytes int) string {
 	}
 	return strings.TrimRight(s[:cut], " \t\r\n") +
 		"\n\n[…содержимое сокращено до " + strconv.Itoa(maxBytes/1000) + " КБ; используйте selector или extract, чтобы прочитать нужный раздел]"
+}
+
+// cleanMarkdown removes harmless backslash escapes that Lightpanda's CommonMark
+// serializer puts inside ordinary words (e.g. `Peer\-to\-peer`, `C\+\+`, `C\#`,
+// `ChaCha20\-Poly1305`) while leaving code blocks, inline code spans, leading
+// list/heading markers, links, emphasis and tables intact.
+func cleanMarkdown(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	var out strings.Builder
+	out.Grow(len(s))
+	var fenceTicks int
+	lines := strings.Split(s, "\n")
+	for li, line := range lines {
+		if li > 0 {
+			out.WriteByte('\n')
+		}
+		if n, rest := fenceRun(line); n >= 3 {
+			if fenceTicks == 0 {
+				fenceTicks = n
+			} else if n >= fenceTicks && strings.TrimSpace(rest) == "" {
+				fenceTicks = 0
+			}
+			out.WriteString(line)
+			continue
+		}
+		if fenceTicks > 0 || !strings.ContainsRune(line, '\\') {
+			out.WriteString(line)
+			continue
+		}
+		atStart := true
+		codeTicks := 0
+		for i := 0; i < len(line); {
+			c := line[i]
+			if c == '`' {
+				j := i
+				for j < len(line) && line[j] == '`' {
+					j++
+				}
+				n := j - i
+				out.WriteString(line[i:j])
+				if codeTicks == 0 {
+					if hasClosingTicks(line[j:], n) {
+						codeTicks = n
+					}
+				} else if n == codeTicks {
+					codeTicks = 0
+				}
+				atStart = false
+				i = j
+				continue
+			}
+			if codeTicks > 0 {
+				out.WriteByte(c)
+				i++
+				continue
+			}
+			if c == '\\' && i+1 < len(line) {
+				next := line[i+1]
+				unescape := false
+				switch next {
+				case '{', '}':
+					unescape = true
+				case '-', '+', '#':
+					unescape = !atStart
+				case '!':
+					unescape = i+2 >= len(line) || line[i+2] != '['
+				}
+				if !unescape {
+					out.WriteByte('\\')
+				}
+				out.WriteByte(next)
+				atStart = false
+				i += 2
+				continue
+			}
+			out.WriteByte(c)
+			if c != ' ' && c != '\t' && !(atStart && c == '>') {
+				atStart = false
+			}
+			i++
+		}
+	}
+	return out.String()
+}
+
+func fenceRun(line string) (int, string) {
+	trimmed := strings.TrimLeft(line, " \t")
+	n := 0
+	for n < len(trimmed) && trimmed[n] == '`' {
+		n++
+	}
+	return n, trimmed[n:]
+}
+
+func hasClosingTicks(s string, want int) bool {
+	for i := 0; i < len(s); {
+		if s[i] != '`' {
+			i++
+			continue
+		}
+		j := i
+		for j < len(s) && s[j] == '`' {
+			j++
+		}
+		if j-i == want {
+			return true
+		}
+		i = j
+	}
+	return false
 }

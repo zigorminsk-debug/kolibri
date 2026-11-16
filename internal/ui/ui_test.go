@@ -651,7 +651,8 @@ func TestWebResearchViewAndSettings(t *testing.T) {
 		t.Fatal("ws:// CDP address should have been rejected")
 	}
 	mcpEntry.SetText("http://127.0.0.1:9222")
-	test.Tap(findButton(t, u, "Сохранить"))
+	saveBtn := findButton(t, u, "Сохранить")
+	u.do(func() { test.Tap(saveBtn) })
 	u.bg.Wait()
 	if saved.LightpandaURL != "http://127.0.0.1:9222/mcp" && saved.LightpandaURL != "http://127.0.0.1:9222" {
 		t.Errorf("saved LightpandaURL = %q", saved.LightpandaURL)
@@ -683,7 +684,8 @@ func TestWebResearchViewAndSettings(t *testing.T) {
 			u.lpManagedDir = t.TempDir()
 			u.lpReleasesURL = relSrv.URL
 			u.showSettings()
-			test.Tap(findButton(t, u, "Установить Lightpanda"))
+			installBtn := findButton(t, u, "Установить Lightpanda")
+			u.do(func() { test.Tap(installBtn) })
 			u.bg.Wait()
 			var sawInstalled bool
 			walk(u, func(o fyne.CanvasObject) {
@@ -694,7 +696,8 @@ func TestWebResearchViewAndSettings(t *testing.T) {
 			if !sawInstalled {
 				t.Error("Settings did not show installed Lightpanda 1.0.4 confirmation")
 			}
-			test.Tap(findButton(t, u, "Проверить Lightpanda"))
+			checkBtn := findButton(t, u, "Проверить Lightpanda")
+			u.do(func() { test.Tap(checkBtn) })
 			u.bg.Wait()
 			var sawChecked bool
 			walk(u, func(o fyne.CanvasObject) {

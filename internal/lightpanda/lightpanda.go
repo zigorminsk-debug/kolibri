@@ -221,7 +221,7 @@ func (b *Browser) mcpArgs() []string {
 		args = append(args, "--http-proxy", proxy)
 	}
 	if !b.AllowLoopback {
-		args = append(args, "--block-urls", blockURLPatterns)
+		args = append(args, "--block-private-networks", "--block-urls", blockURLPatterns)
 	}
 	return args
 }

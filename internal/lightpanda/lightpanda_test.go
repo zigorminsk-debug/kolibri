@@ -743,4 +743,49 @@ func TestRealLightpanda(t *testing.T) {
 		}
 		exercise(t, b)
 	})
+
+	t.Run("hardened-flags", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		sess, err := (&Browser{BinaryPath: bin, ObeyRobots: true}).Open(ctx)
+		if err != nil {
+			t.Fatalf("Open with default hardened flags: %v", err)
+		}
+		defer sess.Close()
+		if r := sess.Do(ctx, Action{Kind: "open", URL: site.URL + "/"}); r.OK() {
+			t.Fatal("default browser must block loopback navigation")
+		}
+	})
+}
+
+func TestCleanMarkdown(t *testing.T) {
+	in := strings.Join([]string{
+		`# Radmin VPN Architecture`,
+		`Peer\-to\-peer UDP with ChaCha20\-Poly1305, C\+\+20 and C\# \(fast\!\) \{v1\}`,
+		`\- not a bullet`,
+		`\+ also not a bullet`,
+		`\# not a heading`,
+		`> \- quoted non\-bullet`,
+		`\![not an image](https://example.com/a.png)`,
+		`Escaped backslash \\- stays and ` + "`code\\-span`" + ` stays`,
+		"```sh",
+		`echo foo\-bar`,
+		"```",
+	}, "\n")
+	want := strings.Join([]string{
+		`# Radmin VPN Architecture`,
+		`Peer-to-peer UDP with ChaCha20-Poly1305, C++20 and C# \(fast!\) {v1}`,
+		`\- not a bullet`,
+		`\+ also not a bullet`,
+		`\# not a heading`,
+		`> \- quoted non-bullet`,
+		`\![not an image](https://example.com/a.png)`,
+		`Escaped backslash \\- stays and ` + "`code\\-span`" + ` stays`,
+		"```sh",
+		`echo foo\-bar`,
+		"```",
+	}, "\n")
+	if got := cleanMarkdown(in); got != want {
+		t.Fatalf("cleanMarkdown:\n got: %s\nwant: %s", got, want)
+	}
 }
